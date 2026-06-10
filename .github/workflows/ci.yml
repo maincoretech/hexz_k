@@ -1,0 +1,122 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  # ── CLI build (no GUI) for all platforms ──
+  build-cli:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            suffix: linux-aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross-compilation deps (Linux ARM)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build CLI
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp target/${{ matrix.target }}/release/hexz.exe hexz-${{ matrix.suffix }}.exe
+          else
+            cp target/${{ matrix.target }}/release/hexz hexz-${{ matrix.suffix }}
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hexz-cli-${{ matrix.suffix }}
+          path: hexz-${{ matrix.suffix }}*
+
+  # ── GUI build for all platforms ──
+  build-gui:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Linux deps (GUI)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
+      - name: Build GUI
+        run: cargo build --release --features gui --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp target/${{ matrix.target }}/release/hexz.exe hexz-gui-${{ matrix.suffix }}.exe
+          else
+            cp target/${{ matrix.target }}/release/hexz hexz-gui-${{ matrix.suffix }}
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hexz-gui-${{ matrix.suffix }}
+          path: hexz-gui-${{ matrix.suffix }}*
+
+  # ── Create GitHub Release (tagged pushes only) ──
+  release:
+    needs: [build-cli, build-gui]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate release notes
+        run: |
+          echo "## hexz_k ${{ github.ref_name }}" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "**CLI**: Command-line interface (no GUI dependencies)" >> CHANGELOG.md
+          echo "**GUI**: Graphical interface with Keka-like UI" >> CHANGELOG.md
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: CHANGELOG.md
+          files: artifacts/hexz-*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
