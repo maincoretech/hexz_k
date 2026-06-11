@@ -3,6 +3,7 @@ name = "hexz_k"
 version = "0.1.0"
 edition = "2024"
 description = "hexz_k — hexz archive tool for game resource packs"
+default-run = "hexz"
 
 [[bin]]
 name = "hexz"

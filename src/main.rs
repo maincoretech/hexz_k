@@ -4,8 +4,6 @@
 //!   hexz pack <input_dir> <output.hxz>   — pack a directory
 //!   hexz gui                              — launch GUI mode
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use clap::{Parser, Subcommand};
 
 mod cmd;

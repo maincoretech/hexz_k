@@ -38,9 +38,6 @@ hexz show game.hxz
 
 # Show metadata (JSON)
 hexz show game.hxz --json
-
-# GUI mode (Keka-like)
-hexz gui
 ```
 
 ## Commands
