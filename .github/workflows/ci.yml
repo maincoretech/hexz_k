@@ -103,18 +103,18 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-          merge-multiple: true
-      - name: Generate release notes
-        run: |
-          echo "## hexz_k ${{ github.ref_name }}" > CHANGELOG.md
-          echo "" >> CHANGELOG.md
-          echo "**CLI**: Command-line interface (no GUI dependencies)" >> CHANGELOG.md
-          echo "**GUI**: Graphical interface with Keka-like UI" >> CHANGELOG.md
+      - name: Show downloaded files
+        run: find artifacts -type f
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
-          body_path: CHANGELOG.md
-          files: artifacts/hexz-*
+          body: |
+            ## hexz_k ${{ github.ref_name }}
+            
+            **CLI** — Command-line interface (no GUI dependencies)
+            **GUI** — Graphical interface with Keka-like UI
+          files: |
+            artifacts/**/hexz-*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
