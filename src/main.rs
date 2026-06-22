@@ -2,7 +2,8 @@
 //!
 //! Usage:
 //!   hexz pack <input_dir> <output.hxz>   — pack a directory
-//!   hexz gui                              — launch GUI mode
+//!   hexz preview <archive.hxz>           — show file tree & metadata
+//!   hexz gui                             — launch GUI mode
 
 use clap::{Parser, Subcommand};
 
@@ -34,9 +35,7 @@ enum Command {
         block_size: u32,
     },
     /// List files in a .hxz archive
-    List {
-        archive: String,
-    },
+    List { archive: String },
     /// Read and output a file from a .hxz archive
     Read {
         archive: String,
@@ -56,6 +55,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Preview archive structure with file tree and category stats
+    Preview {
+        archive: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run compression & IO benchmark
+    Bench,
     /// Launch GUI mode (Keka-like archive tool)
     Gui,
 }
@@ -75,22 +82,39 @@ fn main() -> anyhow::Result<()> {
                 println!("Or use CLI: hexz pack <input> <output>");
             }
         }
-        Some(Command::Pack { input, output, compression, encrypt, block_size }) => {
+        Some(Command::Pack {
+            input,
+            output,
+            compression,
+            encrypt,
+            block_size,
+        }) => {
             let password = if encrypt {
                 Some(match std::env::var("HEXZ_PASSWORD") {
                     Ok(p) => p,
                     Err(_) => rpassword::prompt_password("Encryption password: ")?,
                 })
-            } else { None };
+            } else {
+                None
+            };
             cmd::pack::pack_directory(&cmd::pack::PackOptions {
-                input, output, compression, encrypt, block_size, password,
+                input,
+                output,
+                compression,
+                encrypt,
+                block_size,
+                password,
             })?;
         }
         Some(Command::List { archive }) => {
             let password = read_password_if_needed(&archive)?;
             cmd::read::list_files(&archive, password.as_deref())?;
         }
-        Some(Command::Read { archive, file, output }) => {
+        Some(Command::Read {
+            archive,
+            file,
+            output,
+        }) => {
             let password = read_password_if_needed(&archive)?;
             cmd::read::read_file_path(&archive, &file, output.as_deref(), password.as_deref())?;
         }
@@ -102,22 +126,23 @@ fn main() -> anyhow::Result<()> {
             let password = read_password_if_needed(&archive)?;
             cmd::read::show_metadata(&archive, json, password.as_deref())?;
         }
+        Some(Command::Preview { archive, json }) => {
+            let password = read_password_if_needed(&archive)?;
+            cmd::read::preview_files(&archive, json, password.as_deref())?;
+        }
+        Some(Command::Bench) => {
+            cmd::bench::run()?;
+        }
     }
     Ok(())
 }
 
 fn read_password_if_needed(archive_path: &str) -> anyhow::Result<Option<String>> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(archive_path)?;
-    let mut header_bytes = [0u8; 512];
-    file.read_exact(&mut header_bytes)?;
-    if let Ok(header) = bincode::deserialize::<hexz_core::format::header::Header>(&header_bytes) {
-        if header.encryption.is_some() {
-            return Ok(Some(match std::env::var("HEXZ_PASSWORD") {
-                Ok(p) => p,
-                Err(_) => rpassword::prompt_password("Decryption password: ")?,
-            }));
-        }
+    if hexz_k::is_encrypted(archive_path)? {
+        return Ok(Some(match std::env::var("HEXZ_PASSWORD") {
+            Ok(p) => p,
+            Err(_) => rpassword::prompt_password("Decryption password: ")?,
+        }));
     }
     Ok(None)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "hexz_k"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "hexz_k — hexz archive tool for game resource packs"
 default-run = "hexz"
@@ -8,11 +8,6 @@ default-run = "hexz"
 [[bin]]
 name = "hexz"
 path = "src/main.rs"
-
-[[bin]]
-name = "hexz_bench"
-path = "src/bin/bench.rs"
-required-features = []
 
 [lib]
 name = "hexz_k"
@@ -53,4 +48,11 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2
 strip = true

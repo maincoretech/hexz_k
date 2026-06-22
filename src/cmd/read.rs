@@ -1,116 +1,72 @@
-//! Read/list/extract/show — use hexz_ops APIs (aligned with original hexz-cli)
+//! Read/list/extract/show/preview — thin wrappers over hexz_k public API.
 
 use anyhow::Context;
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::fs;
+use hexz_k::ResourcePack;
 use std::io::Write;
 
-#[derive(Debug, Deserialize)]
-struct HexzMetaFile { path: String, offset: u64, size: u64 }
-
-#[derive(Debug, Deserialize)]
-struct HexzMetadata { files: Vec<HexzMetaFile> }
-
-fn open_archive(path: &std::path::Path, password: Option<&str>) -> anyhow::Result<std::sync::Arc<hexz_core::Archive>> {
-    if let Some(pw) = password {
-        let header = read_header(path)?;
-        if let Some(ref kp) = header.encryption {
-            use hexz_core::algo::encryption::AesGcmEncryptor;
-            let encryptor: Box<dyn hexz_core::algo::encryption::Encryptor> =
-                Box::new(AesGcmEncryptor::new(pw.as_bytes(), &kp.salt, kp.iterations)
-                    .map_err(|e| anyhow::anyhow!("Encryption error: {e}"))?);
-            let archive = hexz_store::open_local(path, Some(encryptor))
-                .context("Failed to open encrypted archive")?;
-            // Verify password by reading first byte — triggers GCM auth tag check on first block
-            let size = archive.size(hexz_core::ArchiveStream::Main);
-            if size > 0 {
-                archive.read_at(hexz_core::ArchiveStream::Main, 0, 1)
-                    .map_err(|_| anyhow::anyhow!("Wrong password or corrupted archive"))?;
-            }
-            Ok(archive)
-        } else {
-            hexz_store::open_local(path, None::<Box<dyn hexz_core::algo::encryption::Encryptor>>)
-                .context("Failed to open archive")
-        }
-    } else {
-        hexz_store::open_local(path, None::<Box<dyn hexz_core::algo::encryption::Encryptor>>)
-            .context("Failed to open archive (maybe encrypted?)")
-    }
-}
-
-fn read_header(path: &std::path::Path) -> anyhow::Result<hexz_core::format::header::Header> {
-    use hexz_core::format::header::Header;
-    let backend: std::sync::Arc<dyn hexz_core::store::StorageBackend> =
-        std::sync::Arc::new(hexz_store::local::MmapBackend::new(path)?);
-    let header_bytes = backend.read_exact(0, hexz_core::format::magic::HEADER_SIZE)?;
-    let header: Header = bincode::deserialize(&header_bytes)?;
-    Ok(header)
-}
-
-fn build_file_index(archive: &hexz_core::Archive) -> anyhow::Result<HashMap<String, (u64, usize)>> {
-    let metadata = archive.metadata.as_ref().context("No metadata in archive")?;
-    let meta: HexzMetadata = serde_json::from_str(
-        std::str::from_utf8(metadata).context("bad utf8")?
-    )?;
-    let mut index = HashMap::new();
-    for f in &meta.files {
-        index.insert(f.path.replace('\\', "/"), (f.offset, f.size as usize));
-    }
-    Ok(index)
-}
-
+/// List all files in an archive.
 pub fn list_files(archive_path: &str, password: Option<&str>) -> anyhow::Result<()> {
-    let path = std::path::Path::new(archive_path);
-    let archive = open_archive(path, password)?;
-    let main_size = archive.size(hexz_core::ArchiveStream::Main);
-    let hashes = archive.iter_block_hashes(hexz_core::ArchiveStream::Main)
-        .context("Failed to iterate blocks")?;
+    let pack = ResourcePack::open(archive_path, password)?;
+    let files = pack.list_files();
     println!("Archive: {}", archive_path);
-    println!("Size: {:.2} MB  Blocks: {}", main_size as f64 / 1_048_576.0, hashes.len());
-    match build_file_index(&archive) {
-        Ok(index) => {
-            let mut files: Vec<_> = index.iter().collect();
-            files.sort_by_key(|(p, _)| *p);
-            println!("Files: {}", files.len());
-            for (path, (offset, size)) in &files {
-                println!("  {:>10} B  @{:<10}  {}", size, offset, path);
-            }
-        }
-        Err(e) => println!("No file index: {e}"),
+    println!("  Size: {:.2} MB", pack.main_size() as f64 / 1_048_576.0);
+    println!("  Files: {}", files.len());
+    let mut sorted: Vec<_> = files.iter().collect();
+    sorted.sort();
+    for path in &sorted {
+        println!("  {path}");
     }
     Ok(())
 }
 
-pub fn read_file_path(archive_path: &str, file_path: &str, output: Option<&str>, password: Option<&str>) -> anyhow::Result<()> {
-    let path = std::path::Path::new(archive_path);
-    let archive = open_archive(path, password)?;
-    let index = build_file_index(&archive)?;
-    let normalized = file_path.replace('\\', "/");
-    let (offset, size) = index.get(&normalized)
-        .or_else(|| index.iter().find(|(k, _)| k.ends_with(&normalized)).map(|(_, v)| v))
-        .context(format!("File not found: {}", file_path))?;
-    let data = archive.read_at(hexz_core::ArchiveStream::Main, *offset, *size)?;
+/// Read a single file from an archive and print to stdout or save to disk.
+pub fn read_file_path(
+    archive_path: &str,
+    file_path: &str,
+    output: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<()> {
+    let pack = ResourcePack::open(archive_path, password)?;
+    let data = pack.read_file(file_path)?;
     match output {
-        Some(out_path) => { fs::write(out_path, &data)?; println!("{} bytes -> {}", data.len(), out_path); }
-        None => { std::io::stdout().write_all(&data)?; }
+        Some(out_path) => {
+            std::fs::write(out_path, &data)?;
+            println!("{} bytes -> {}", data.len(), out_path);
+        }
+        None => {
+            std::io::stdout().write_all(&data)?;
+        }
     }
     Ok(())
 }
 
-pub fn extract_all(archive_path: &str, output_dir: &str, password: Option<&str>) -> anyhow::Result<()> {
+/// Extract all files from an archive to a directory.
+pub fn extract_all(
+    archive_path: &str,
+    output_dir: &str,
+    password: Option<&str>,
+) -> anyhow::Result<()> {
     use hexz_ops::pack::extract_archive;
     println!("Extracting {} -> {}", archive_path, output_dir);
-    extract_archive(archive_path.as_ref(), output_dir.as_ref(), password.map(|s| s.to_string()))
-        .context("Failed to extract archive")?;
+    extract_archive(
+        archive_path.as_ref(),
+        output_dir.as_ref(),
+        password.map(|s| s.to_string()),
+    )
+    .context("Failed to extract archive")?;
     println!("Done.");
     Ok(())
 }
 
-pub fn show_metadata(archive_path: &str, json: bool, _password: Option<&str>) -> anyhow::Result<()> {
+/// Show archive header metadata (compression, encryption, sizes).
+pub fn show_metadata(
+    archive_path: &str,
+    json: bool,
+    _password: Option<&str>,
+) -> anyhow::Result<()> {
     use hexz_ops::inspect::inspect_archive;
-    let info = inspect_archive(std::path::Path::new(archive_path))
-        .context("Failed to inspect archive")?;
+    let info =
+        inspect_archive(std::path::Path::new(archive_path)).context("Failed to inspect archive")?;
     let total = info.total_uncompressed();
     let ratio = info.compression_ratio();
 
@@ -133,10 +89,73 @@ pub fn show_metadata(archive_path: &str, json: bool, _password: Option<&str>) ->
         };
         println!("Archive: {}", archive_path);
         println!("  version:     v{}", info.version);
-        println!("  compression: {} ({} KiB blocks)", comp, info.block_size / 1024);
-        println!("  size:        {} on disk, {} uncompressed ({:.2}x)",
-            info.file_size, total, ratio);
+        println!(
+            "  compression: {} ({} KiB blocks)",
+            comp,
+            info.block_size / 1024
+        );
+        println!(
+            "  size:        {} on disk, {} uncompressed ({:.2}x)",
+            info.file_size, total, ratio
+        );
         println!("  encrypted:   {}", info.features.encrypted);
+    }
+    Ok(())
+}
+
+/// Preview archive structure with file tree and metadata stats
+pub fn preview_files(archive_path: &str, json: bool, password: Option<&str>) -> anyhow::Result<()> {
+    let pack = ResourcePack::open(archive_path, password)?;
+    let meta = pack.build_metadata();
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&meta)?);
+    } else {
+        use hexz_ops::inspect::inspect_archive;
+        let info = inspect_archive(std::path::Path::new(archive_path))
+            .context("Failed to inspect archive")?;
+
+        println!("═══════════════════════════════════════");
+        println!("  Archive: {}", archive_path);
+        println!("  Version: v{}", info.version);
+        let comp = match info.compression {
+            hexz_core::format::header::CompressionType::Lz4 => "LZ4",
+            hexz_core::format::header::CompressionType::Zstd => "Zstd",
+        };
+        println!(
+            "  Compression: {} ({} KiB blocks)",
+            comp,
+            info.block_size / 1024
+        );
+        println!("  Encrypted: {}", info.features.encrypted);
+        println!("  On-disk:  {}", hexz_k::format_size(info.file_size));
+        println!("  Unpacked: {}", hexz_k::format_size(meta.total_size));
+        println!("  Ratio: {:.2}x", info.compression_ratio());
+        println!("  Files: {}", meta.total_files);
+
+        println!("───────────────────────────────────────");
+        println!("  Category breakdown:");
+        let mut cats: Vec<_> = meta.category_counts.iter().collect();
+        cats.sort_by_key(|(c, _)| format!("{c:?}"));
+        for (cat, (count, size)) in &cats {
+            let pct = if meta.total_size > 0 {
+                *size as f64 / meta.total_size as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "    {:<10} {:>5} files  {:>10}  ({:>4.0}%)",
+                format!("{cat}:"),
+                count,
+                hexz_k::format_size(*size),
+                pct,
+            );
+        }
+
+        println!("───────────────────────────────────────");
+        println!("  File tree:");
+        print!("{}", meta.file_tree);
+        println!("═══════════════════════════════════════");
     }
     Ok(())
 }

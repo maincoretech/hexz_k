@@ -1,41 +1,49 @@
-//! Pack command — uses hexz_ops::pack::pack_archive API
+//! Pack command — uses `hexz_ops::pack::pack_archive`.
 
 use anyhow::Context;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// Configuration for packing a directory into a `.hxz` archive.
 pub struct PackOptions {
+    /// Source directory path.
     pub input: String,
+    /// Output `.hxz` file path.
     pub output: String,
+    /// Compression algorithm: `"lz4"` or `"zstd"`.
     pub compression: String,
+    /// Enable AES-256-GCM encryption.
     pub encrypt: bool,
+    /// Block size in bytes (default 65536).
     pub block_size: u32,
+    /// Optional encryption password.
     pub password: Option<String>,
 }
 
-#[allow(dead_code)]
-pub struct PackProgress {
-    pub done: u64,
-    pub total: u64,
-    pub finished: bool,
-}
-
+/// Thread-safe progress tracker for pack operations.
 #[derive(Default, Clone)]
 pub struct ProgressTracker {
     pub inner: Arc<Mutex<(u64, u64, bool)>>,
 }
 
 impl ProgressTracker {
-    pub fn new() -> Self { Self::default() }
-    #[allow(dead_code)]
-    pub fn get(&self) -> (u64, u64, bool) { *self.inner.lock().unwrap() }
+    /// Create a new progress tracker with zero progress.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Read current progress: (done, total, finished).
+    #[cfg(feature = "gui")]
+    pub fn get(&self) -> (u64, u64, bool) {
+        *self.inner.lock().unwrap()
+    }
 }
 
+/// Pack a directory with progress callback (for GUI).
 pub fn pack_directory_with_progress(
     opts: &PackOptions,
     tracker: ProgressTracker,
 ) -> anyhow::Result<()> {
-    use hexz_ops::pack::{pack_archive, PackConfig, PackTransformFlags};
+    use hexz_ops::pack::{PackConfig, PackTransformFlags, pack_archive};
 
     let t = tracker.clone();
     let cb = move |done: u64, total: u64| {
@@ -65,6 +73,7 @@ pub fn pack_directory_with_progress(
     Ok(())
 }
 
+/// Pack a directory without progress tracking (for CLI).
 pub fn pack_directory(opts: &PackOptions) -> anyhow::Result<()> {
     let tracker = ProgressTracker::new();
     pack_directory_with_progress(opts, tracker)
