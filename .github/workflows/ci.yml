@@ -89,6 +89,28 @@ jobs:
           else
             cp target/${{ matrix.target }}/release/hexz hexz-gui-${{ matrix.suffix }}
           fi
+      - name: Create macOS .app bundle
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          APP="hexz-gui-${{ matrix.suffix }}.app"
+          mkdir -p "$APP/Contents/MacOS"
+          cp target/${{ matrix.target }}/release/hexz "$APP/Contents/MacOS/hexz"
+          cat > "$APP/Contents/Info.plist" << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>  <string>hexz</string>
+              <key>CFBundleName</key>        <string>hexz</string>
+              <key>CFBundleIdentifier</key>  <string>com.hexz.app</string>
+              <key>CFBundleVersion</key>     <string>${{ github.ref_name }}</string>
+              <key>CFBundleShortVersionString</key> <string>${{ github.ref_name }}</string>
+              <key>LSUIElement</key>         <true/>
+              <key>NSHighResolutionCapable</key> <true/>
+          </dict>
+          </plist>
+          PLIST
       - uses: actions/upload-artifact@v4
         with:
           name: hexz-gui-${{ matrix.suffix }}

@@ -177,13 +177,24 @@ impl Archive {
     }
 }
 
-#[derive(Default)]
 struct PackForm {
     input: String,
     output: String,
-    compression: usize,
+    compression: usize,  // 0 = LZ4, 1 = Zstd
     encrypt: bool,
     password: String,
+}
+
+impl Default for PackForm {
+    fn default() -> Self {
+        Self {
+            input: String::new(),
+            output: String::new(),
+            compression: 1, // default to Zstd
+            encrypt: false,
+            password: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
