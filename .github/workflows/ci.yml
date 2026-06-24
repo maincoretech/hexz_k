@@ -109,7 +109,7 @@ jobs:
               <key>CFBundleIconFile</key>    <string>hexz</string>
               <key>CFBundleVersion</key>     <string>${{ github.ref_name }}</string>
               <key>CFBundleShortVersionString</key> <string>${{ github.ref_name }}</string>
-              <key>LSUIElement</key>         <true/>
+              <key>LSUIElement</key>         <false/>
               <key>NSHighResolutionCapable</key> <true/>
           </dict>
           </plist>
@@ -143,7 +143,7 @@ jobs:
           path: artifacts
           merge-multiple: true
       - name: Get latest tag
-        run: echo "LATEST_TAG=$(git describe --tags --abbrev=0)" >> $GITHUB_ENV
+        run: echo "LATEST_TAG=$(git tag --sort=-creatordate | head -1)" >> $GITHUB_ENV
       - name: Show downloaded files
         run: ls -la artifacts/
       - name: Update Release
