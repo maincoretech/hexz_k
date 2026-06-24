@@ -48,7 +48,7 @@ jobs:
           else
             cp target/${{ matrix.target }}/release/hexz hexz-${{ matrix.suffix }}
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: hexz-cli-${{ matrix.suffix }}
           path: hexz-${{ matrix.suffix }}*
@@ -94,8 +94,10 @@ jobs:
         shell: bash
         run: |
           APP="hexz-gui-${{ matrix.suffix }}.app"
-          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp target/${{ matrix.target }}/release/hexz "$APP/Contents/MacOS/hexz"
+          cp assets/hexz.icns "$APP/Contents/Resources/hexz.icns"
+          chmod +x "$APP/Contents/MacOS/hexz"
           cat > "$APP/Contents/Info.plist" << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -104,6 +106,7 @@ jobs:
               <key>CFBundleExecutable</key>  <string>hexz</string>
               <key>CFBundleName</key>        <string>hexz</string>
               <key>CFBundleIdentifier</key>  <string>com.hexz.app</string>
+              <key>CFBundleIconFile</key>    <string>hexz</string>
               <key>CFBundleVersion</key>     <string>${{ github.ref_name }}</string>
               <key>CFBundleShortVersionString</key> <string>${{ github.ref_name }}</string>
               <key>LSUIElement</key>         <true/>
@@ -111,33 +114,50 @@ jobs:
           </dict>
           </plist>
           PLIST
-      - uses: actions/upload-artifact@v4
+          codesign --force --deep --sign - "$APP"
+          zip -r "hexz-gui-${{ matrix.suffix }}.app.zip" "$APP"
+      - name: Upload binary
+        uses: actions/upload-artifact@v5
         with:
           name: hexz-gui-${{ matrix.suffix }}
-          path: hexz-gui-${{ matrix.suffix }}*
+          path: hexz-gui-${{ matrix.suffix }}
+      - name: Upload macOS .app bundle
+        if: startsWith(matrix.os, 'macos')
+        uses: actions/upload-artifact@v5
+        with:
+          name: hexz-gui-${{ matrix.suffix }}-app
+          path: hexz-gui-${{ matrix.suffix }}.app.zip
 
-  # ── Create GitHub Release (tagged pushes only) ──
+  # ── GitHub Release (push to main → update latest tag) ──
   release:
     needs: [build-cli, build-gui]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v5
         with:
           pattern: hexz-*
           path: artifacts
           merge-multiple: true
+      - name: Get latest tag
+        run: echo "LATEST_TAG=$(git describe --tags --abbrev=0)" >> $GITHUB_ENV
       - name: Show downloaded files
         run: ls -la artifacts/
-      - name: Create Release
+      - name: Update Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: ${{ env.LATEST_TAG }}
+          name: ${{ env.LATEST_TAG }}
           body: |
-            ## hexz_k ${{ github.ref_name }}
-            
+            ## hexz_k ${{ env.LATEST_TAG }}
+
+            Auto-updated on push to `main`.
+
             **CLI** — Command-line interface (no GUI dependencies)
-            **GUI** — Graphical interface with Keka-like UI
+            **GUI** — Graphical interface with Keka-like UI (macOS .app included)
           files: artifacts/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
