@@ -48,7 +48,7 @@ jobs:
           else
             cp target/${{ matrix.target }}/release/hexz hexz-${{ matrix.suffix }}
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: hexz-cli-${{ matrix.suffix }}
           path: hexz-${{ matrix.suffix }}*
@@ -96,6 +96,7 @@ jobs:
           APP="hexz-gui-${{ matrix.suffix }}.app"
           mkdir -p "$APP/Contents/MacOS"
           cp target/${{ matrix.target }}/release/hexz "$APP/Contents/MacOS/hexz"
+          chmod +x "$APP/Contents/MacOS/hexz"
           cat > "$APP/Contents/Info.plist" << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -111,33 +112,47 @@ jobs:
           </dict>
           </plist>
           PLIST
-      - uses: actions/upload-artifact@v4
+          # Ad-hoc code sign (required by macOS Gatekeeper)
+          codesign --force --deep --sign - "$APP"
+          zip -r "hexz-gui-${{ matrix.suffix }}.app.zip" "$APP"
+      - name: Upload binary
+        uses: actions/upload-artifact@v5
         with:
           name: hexz-gui-${{ matrix.suffix }}
-          path: hexz-gui-${{ matrix.suffix }}*
+          path: hexz-gui-${{ matrix.suffix }}
+      - name: Upload macOS .app bundle
+        if: startsWith(matrix.os, 'macos')
+        uses: actions/upload-artifact@v5
+        with:
+          name: hexz-gui-${{ matrix.suffix }}-app
+          path: hexz-gui-${{ matrix.suffix }}.app.zip
 
-  # ── Create GitHub Release (tagged pushes only) ──
+  # ── GitHub Release (on every push to main) ──
   release:
     needs: [build-cli, build-gui]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           pattern: hexz-*
           path: artifacts
           merge-multiple: true
       - name: Show downloaded files
         run: ls -la artifacts/
-      - name: Create Release
+      - name: Create / Update Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: latest
+          name: Latest Build
           body: |
-            ## hexz_k ${{ github.ref_name }}
+            ## hexz_k — Latest Build
+            
+            Auto-built from `main` branch on every push.
             
             **CLI** — Command-line interface (no GUI dependencies)
             **GUI** — Graphical interface with Keka-like UI
           files: artifacts/*
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
