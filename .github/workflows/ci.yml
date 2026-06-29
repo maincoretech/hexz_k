@@ -120,7 +120,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: hexz-gui-${{ matrix.suffix }}
-          path: hexz-gui-${{ matrix.suffix }}
+          path: hexz-gui-${{ matrix.suffix }}*
       - name: Upload macOS .app bundle
         if: startsWith(matrix.os, 'macos')
         uses: actions/upload-artifact@v5
