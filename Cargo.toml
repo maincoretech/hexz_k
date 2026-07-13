@@ -8,6 +8,7 @@ default-run = "hexz"
 [[bin]]
 name = "hexz"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [lib]
 name = "hexz_k"
@@ -15,12 +16,12 @@ path = "src/lib.rs"
 
 [dependencies]
 # Hexz ecosystem
-hexz-core = "0.8"
-hexz-store = "0.8"
-hexz-ops = "0.8"
+hexz-core = { version = "0.8", default-features = false, features = ["compression-zstd", "encryption"] }
+hexz-store = { version = "0.8", default-features = false }
+hexz-ops = { version = "0.8", default-features = false, features = ["compression-zstd", "encryption"], optional = true }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -30,18 +31,19 @@ serde_json = "1"
 anyhow = "1"
 
 # Password input
-rpassword = "7"
+rpassword = { version = "7", optional = true }
 bincode = "1"
 
 # GUI (optional, compile without for CLI-only)
 egui = { version = "0.31", optional = true }
 eframe = { version = "0.31", optional = true }
 rfd = { version = "0.15", optional = true }
-image = { version = "0.25", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
 [features]
-default = []
-gui = ["egui", "eframe", "rfd", "image"]
+default = ["cli"]
+cli = ["dep:clap", "dep:hexz-ops", "dep:rpassword"]
+gui = ["cli", "egui", "eframe", "rfd", "image"]
 
 [profile.release]
 opt-level = 3

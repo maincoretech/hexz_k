@@ -14,15 +14,20 @@ pub fn run() -> anyhow::Result<()> {
 
     let work_dir = std::env::temp_dir().join("hexz_bench");
     if let Err(e) = std::fs::remove_dir_all(&work_dir)
-        && e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("  warn: cleanup failed: {e}");
-        }
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("  warn: cleanup failed: {e}");
+    }
     std::fs::create_dir_all(&work_dir)?;
+    let input_dir = work_dir.join("input");
+    let output_dir = work_dir.join("output");
+    std::fs::create_dir_all(&input_dir)?;
+    std::fs::create_dir_all(&output_dir)?;
 
     println!("Generating test data...");
-    let fsize = bench::generate_test_files(&work_dir)?;
+    let fsize = bench::generate_game_test_files(&input_dir)?;
     println!(
-        "  {:.1} MiB (lorem text, highly compressible)\n",
+        "  {:.1} MiB (scenario, background, voice, and UI assets)\n",
         fsize as f64 / 1_048_576.0
     );
 
@@ -32,9 +37,9 @@ pub fn run() -> anyhow::Result<()> {
 
     for (comp, bs) in bench::BENCH_CONFIGS {
         let label = format!("{comp} {}KiB", bs / 1024);
-        let archive = work_dir.join(format!("bench_{comp}_{bs}.hxz"));
+        let archive = output_dir.join(format!("bench_{comp}_{bs}.hxz"));
         let archive_str = archive.to_string_lossy().to_string();
-        let dir_str = work_dir.to_string_lossy().to_string();
+        let dir_str = input_dir.to_string_lossy().to_string();
 
         let mut sum_pack = 0u128;
         let mut sum_seq = 0f64;
@@ -79,16 +84,17 @@ pub fn run() -> anyhow::Result<()> {
 
     println!("\n──────────────────────────────────────────────");
     println!(
-        "  Total test data: {:.1} MiB (lorem)",
+        "  Total test data: {:.1} MiB (mixed game assets)",
         fsize as f64 / 1_048_576.0
     );
     println!("  Best sequential: {:.1} MB/s", best_read);
     println!("  Best IOPS: {:.0}", best_iops);
 
     if let Err(e) = std::fs::remove_dir_all(&work_dir)
-        && e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("  warn: cleanup failed: {e}");
-        }
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("  warn: cleanup failed: {e}");
+    }
     println!("══════════════════════════════════════════════");
     Ok(())
 }

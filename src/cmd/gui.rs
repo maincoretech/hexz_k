@@ -61,6 +61,31 @@ fn cat_icon(c: Option<&FileCategory>) -> &str {
     }
 }
 
+fn find_directory<'a>(root: &'a TreeNode, path: &str) -> Option<&'a TreeNode> {
+    path.split('/')
+        .filter(|part| !part.is_empty())
+        .try_fold(root, |directory, part| {
+            directory
+                .children
+                .iter()
+                .find(|child| child.is_dir && child.name == part)
+        })
+}
+
+fn safe_output_path(root: &std::path::Path, archive_path: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+
+    let path = std::path::Path::new(archive_path);
+    if path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+    {
+        Some(root.join(path))
+    } else {
+        None
+    }
+}
+
 // ── entry point ───────────────────────────────────────────────────────────
 
 /// Launch the egui GUI window.
@@ -81,6 +106,14 @@ pub fn run_gui() -> anyhow::Result<()> {
             ..Default::default()
         },
         Box::new(|cc| {
+            let gray = |level| egui::Color32::from_gray(level);
+            let mut visuals = egui::Visuals::dark();
+            visuals.widgets.active.bg_fill = gray(90);
+            visuals.widgets.hovered.bg_fill = gray(110);
+            visuals.widgets.inactive.bg_fill = gray(60);
+            visuals.selection.bg_fill = gray(100);
+            visuals.selection.stroke = egui::Stroke::new(1.0, gray(140));
+            cc.egui_ctx.set_visuals(visuals);
             if let Some(font_data) = try_cjk_font() {
                 let mut fonts = egui::FontDefinitions::default();
                 fonts
@@ -118,7 +151,8 @@ struct Archive {
     password: String,
     encrypted: bool,
     pack: Option<ResourcePack>,
-    meta: Option<PackMetadata>,
+    meta: Option<Arc<PackMetadata>>,
+    category_chips: Vec<(FileCategory, usize, u64)>,
     error: Option<String>,
     file_size: u64,
     open_dirs: HashSet<String>,
@@ -126,61 +160,17 @@ struct Archive {
     ctx_menu: Option<String>,
 }
 
-impl Archive {
-    fn open(&mut self) {
-        self.error = None;
-        self.meta = None;
-        self.pack = None;
-        self.open_dirs.clear();
-        self.selected.clear();
-        self.ctx_menu = None;
-        self.file_size = 0;
-
-        if let Ok(meta) = std::fs::metadata(&self.path) {
-            self.file_size = meta.len();
-        }
-
-        let password = if self.encrypted && !self.password.is_empty() {
-            Some(self.password.as_str())
-        } else {
-            None
-        };
-
-        match ResourcePack::open(&self.path, password) {
-            Ok(pack) => {
-                self.meta = Some(pack.build_metadata());
-                self.pack = Some(pack);
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("encrypt") || msg.contains("password") || msg.contains("auth") {
-                    self.encrypted = true;
-                    self.error = Some("Wrong password or encrypted — check Key.".into());
-                } else {
-                    self.error = Some(format!("Failed: {msg}"));
-                }
-            }
-        }
-    }
-
-    fn cat_chips(&self) -> Vec<(FileCategory, usize, u64)> {
-        let Some(ref meta) = self.meta else {
-            return vec![];
-        };
-        let mut chips: Vec<_> = meta
-            .category_counts
-            .iter()
-            .map(|(cat, (count, size))| (cat.clone(), *count, *size))
-            .collect();
-        chips.sort_by_key(|(cat, _, _)| format!("{cat:?}"));
-        chips
-    }
+struct LoadedArchive {
+    pack: ResourcePack,
+    meta: Arc<PackMetadata>,
+    category_chips: Vec<(FileCategory, usize, u64)>,
+    file_size: u64,
 }
 
 struct PackForm {
     input: String,
     output: String,
-    compression: usize,  // 0 = LZ4, 1 = Zstd
+    compression: usize, // 0 = LZ4, 1 = Zstd
     encrypt: bool,
     password: String,
 }
@@ -229,7 +219,8 @@ struct App {
     busy: bool,
     progress: (u64, u64),
     start: Option<Instant>,
-    worker: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    worker: Option<std::thread::JoinHandle<anyhow::Result<String>>>,
+    open_worker: Option<std::thread::JoinHandle<anyhow::Result<LoadedArchive>>>,
     tracker: Option<ProgressTracker>,
 }
 
@@ -252,6 +243,7 @@ impl Default for App {
             progress: (0, 0),
             start: None,
             worker: None,
+            open_worker: None,
             tracker: None,
         }
     }
@@ -261,6 +253,7 @@ impl Default for App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_open_worker();
         self.poll_worker();
 
         let mut load_trigger = false;
@@ -269,16 +262,6 @@ impl eframe::App for App {
                 load_trigger = true;
             }
         });
-
-        // visuals
-        let gray = |level| egui::Color32::from_gray(level);
-        let mut visuals = egui::Visuals::dark();
-        visuals.widgets.active.bg_fill = gray(90);
-        visuals.widgets.hovered.bg_fill = gray(110);
-        visuals.widgets.inactive.bg_fill = gray(60);
-        visuals.selection.bg_fill = gray(100);
-        visuals.selection.stroke = egui::Stroke::new(1.0, gray(140));
-        ctx.set_visuals(visuals);
 
         // header
         egui::TopBottomPanel::top("head")
@@ -330,24 +313,69 @@ impl eframe::App for App {
                 }
             });
 
-        if self.busy {
+        if self.busy || self.bench_running {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 }
 
 impl App {
+    fn poll_open_worker(&mut self) {
+        let Some(worker) = self.open_worker.as_ref() else {
+            return;
+        };
+        if !worker.is_finished() {
+            return;
+        }
+
+        let result = self.open_worker.take().unwrap().join();
+        match result {
+            Ok(Ok(loaded)) => {
+                self.arc.file_size = loaded.file_size;
+                self.arc.category_chips = loaded.category_chips;
+                self.arc.meta = Some(loaded.meta);
+                self.arc.pack = Some(loaded.pack);
+                self.status = "Loaded.".into();
+            }
+            Ok(Err(error)) => {
+                let message = error.to_string();
+                if message.contains("encrypt")
+                    || message.contains("password")
+                    || message.contains("auth")
+                {
+                    self.arc.encrypted = true;
+                    self.arc.error = Some("Wrong password or encrypted — check Key.".into());
+                } else {
+                    self.arc.error = Some(format!("Failed: {message}"));
+                }
+                self.status = "Open failed.".into();
+            }
+            Err(_) => {
+                self.arc.error = Some("Archive loader panicked.".into());
+                self.status = "Open failed.".into();
+            }
+        }
+        self.busy = false;
+    }
+
     fn poll_worker(&mut self) {
         let Some(ref tracker) = self.tracker else {
             return;
         };
         let (done, total, finished) = tracker.get();
         self.progress = (done, total);
-        if !finished {
+        let worker_finished = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished());
+        if !finished && !worker_finished {
             return;
         }
-        let ok = self.worker.take().unwrap().join().is_ok();
-        self.status = if ok { "Done.".into() } else { "Error.".into() };
+        self.status = match self.worker.take().unwrap().join() {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) => format!("Error: {error:#}"),
+            Err(_) => "Error: background worker panicked".into(),
+        };
         self.busy = false;
         self.tracker = None;
     }
@@ -477,7 +505,8 @@ impl App {
         let clone = tracker.clone();
         self.tracker = Some(tracker);
         self.worker = Some(std::thread::spawn(move || {
-            pack::pack_directory_with_progress(&opts, clone)
+            pack::pack_directory_with_progress(&opts, clone)?;
+            Ok("Packed archive.".into())
         }));
     }
 
@@ -493,21 +522,30 @@ impl App {
         {
             self.bench_running = true;
             self.bench_results.lock().unwrap().clear();
+            *self.bench_progress.lock().unwrap() = BenchProgress {
+                step: 0,
+                total: bench::GAME_BENCH_GROUPS.len() + bench::BENCH_CONFIGS.len() + 1,
+                msg: "Generating test data…".into(),
+            };
             let results = self.bench_results.clone();
             let progress = self.bench_progress.clone();
             std::thread::spawn(move || {
                 let tmp = std::env::temp_dir().join("hexz_gui_bench");
                 let _ = std::fs::remove_dir_all(&tmp);
                 let _ = std::fs::create_dir_all(&tmp);
+                let input_dir = tmp.join("input");
+                let output_dir = tmp.join("output");
+                let _ = std::fs::create_dir_all(&input_dir);
+                let _ = std::fs::create_dir_all(&output_dir);
 
                 // Step 0: generate
                 {
                     let mut p = progress.lock().unwrap();
                     p.step = 0;
-                    p.total = bench::BENCH_SPECS.len() + bench::BENCH_CONFIGS.len();
+                    p.total = bench::GAME_BENCH_GROUPS.len() + bench::BENCH_CONFIGS.len() + 1;
                     p.msg = "Generating test data…".into();
                 }
-                let total = match bench::generate_test_files(&tmp) {
+                let total = match bench::generate_game_test_files(&input_dir) {
                     Ok(t) => t,
                     Err(e) => {
                         let mut p = progress.lock().unwrap();
@@ -518,8 +556,9 @@ impl App {
                 };
 
                 for (i, (comp, bs)) in bench::BENCH_CONFIGS.iter().enumerate() {
-                    let step = bench::BENCH_SPECS.len() + i + 1;
-                    let total_steps = bench::BENCH_SPECS.len() + bench::BENCH_CONFIGS.len() + 1;
+                    let step = bench::GAME_BENCH_GROUPS.len() + i + 1;
+                    let total_steps =
+                        bench::GAME_BENCH_GROUPS.len() + bench::BENCH_CONFIGS.len() + 1;
                     {
                         let mut p = progress.lock().unwrap();
                         p.step = step;
@@ -528,7 +567,7 @@ impl App {
                     }
 
                     let label = format!("{comp} {}KiB", bs / 1024);
-                    let archive = tmp.join(format!("bench_{comp}_{bs}.hxz"));
+                    let archive = output_dir.join(format!("bench_{comp}_{bs}.hxz"));
 
                     const ROUNDS: usize = 3;
                     let mut sum_pack = 0u128;
@@ -538,7 +577,7 @@ impl App {
                     for _ in 0..ROUNDS {
                         let t0 = Instant::now();
                         let opts = crate::cmd::pack::PackOptions {
-                            input: tmp.to_string_lossy().to_string(),
+                            input: input_dir.to_string_lossy().to_string(),
                             output: archive.to_string_lossy().to_string(),
                             compression: comp.to_string(),
                             encrypt: false,
@@ -557,11 +596,14 @@ impl App {
                         }
                     }
 
-                    let archive_sz =
-                        std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(1);
+                    let archive_sz = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(1);
                     let entry = BenchEntry {
                         label: label.clone(),
-                        pack_ms: if ROUNDS > 0 { sum_pack / ROUNDS as u128 } else { 0 },
+                        pack_ms: if ROUNDS > 0 {
+                            sum_pack / ROUNDS as u128
+                        } else {
+                            0
+                        },
                         ratio: total as f64 / archive_sz as f64,
                         seq_mbps: sum_seq / ROUNDS as f64,
                         iops: sum_iops / ROUNDS as f64,
@@ -593,6 +635,9 @@ impl App {
                 } else {
                     ui.label(&p.msg);
                 }
+                if p.step >= p.total && p.total > 0 {
+                    self.bench_running = false;
+                }
             }
         }
 
@@ -601,12 +646,6 @@ impl App {
             if !entries.is_empty() {
                 ui.separator();
                 self.draw_bench_chart(ui, &entries);
-                // Auto-detect completion
-                if let Ok(p) = self.bench_progress.try_lock() {
-                    if p.step >= p.total && p.total > 0 {
-                        self.bench_running = false;
-                    }
-                }
             }
         }
     }
@@ -649,7 +688,11 @@ impl App {
                                 egui::Color32::from_gray(140),
                             );
                             ui.label(egui::RichText::new(ellipsize(&e.label, 10)).size(12.0));
-                            ui.label(egui::RichText::new(&info).size(11.0).color(egui::Color32::from_gray(160)));
+                            ui.label(
+                                egui::RichText::new(&info)
+                                    .size(11.0)
+                                    .color(egui::Color32::from_gray(160)),
+                            );
                         });
                     }
                 });
@@ -679,7 +722,11 @@ impl App {
                                 egui::Color32::from_gray(100),
                             );
                             ui.label(egui::RichText::new(ellipsize(&e.label, 10)).size(12.0));
-                            ui.label(egui::RichText::new(&info).size(11.0).color(egui::Color32::from_gray(160)));
+                            ui.label(
+                                egui::RichText::new(&info)
+                                    .size(11.0)
+                                    .color(egui::Color32::from_gray(160)),
+                            );
                         });
                     }
                 });
@@ -755,21 +802,52 @@ impl App {
     }
 
     fn open_archive(&mut self) {
-        self.arc.open();
+        let path = self.arc.path.clone();
+        let password = if self.arc.encrypted && !self.arc.password.is_empty() {
+            Some(self.arc.password.clone())
+        } else {
+            None
+        };
+        self.arc.error = None;
+        self.arc.meta = None;
+        self.arc.category_chips.clear();
+        self.arc.pack = None;
+        self.arc.open_dirs.clear();
+        self.arc.selected.clear();
+        self.arc.ctx_menu = None;
+        self.arc.file_size = 0;
         self.grid_path.clear();
         self.grid_drag_start = None;
         self.grid_drag_now = None;
-        self.status = "Loaded.".into();
+        self.busy = true;
+        self.status = "Loading archive…".into();
+        self.open_worker = Some(std::thread::spawn(move || {
+            let file_size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            let pack = ResourcePack::open(&path, password.as_deref())?;
+            let meta = Arc::new(pack.build_metadata());
+            let mut category_chips: Vec<_> = meta
+                .category_counts
+                .iter()
+                .map(|(category, (count, size))| (*category, *count, *size))
+                .collect();
+            category_chips.sort_unstable_by_key(|(category, _, _)| *category);
+            Ok(LoadedArchive {
+                pack,
+                meta,
+                category_chips,
+                file_size,
+            })
+        }));
     }
 
     fn render_browse_content(&mut self, ui: &mut egui::Ui) {
         ui.separator();
 
         // category chips
-        let cats = self.arc.cat_chips();
+        let cats = &self.arc.category_chips;
         if !cats.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                for (cat, count, size) in &cats {
+                for (cat, count, size) in cats {
                     let total = self.arc.meta.as_ref().map(|m| m.total_size).unwrap_or(1);
                     let pct = if total > 0 {
                         *size as f64 / total as f64 * 100.0
@@ -817,7 +895,8 @@ impl App {
 
         ui.separator();
 
-        let tree = self.arc.meta.as_ref().unwrap().file_tree.clone();
+        let meta = Arc::clone(self.arc.meta.as_ref().unwrap());
+        let tree = &meta.file_tree;
         match self.browse_mode {
             BrowseMode::List => {
                 egui::ScrollArea::vertical()
@@ -834,7 +913,7 @@ impl App {
                     .id_salt("grid")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.render_grid(ui, &tree, "");
+                        self.render_grid(ui, tree);
                     });
             }
         }
@@ -966,43 +1045,28 @@ impl App {
 
     // ── grid view ───────────────────────────────────────────────────────
 
-    fn collect_items(
-        &self,
-        node: &TreeNode,
-        prefix: &str,
-        out: &mut Vec<(String, String, bool, u64, Option<FileCategory>)>,
-    ) {
-        let full = if prefix.is_empty() {
-            node.name.clone()
-        } else {
-            format!("{prefix}/{}", node.name)
-        };
-        if node.is_dir {
-            out.push((full.clone(), node.name.clone(), true, 0, None));
-            for child in &node.children {
-                self.collect_items(child, &full, out);
-            }
-        } else {
-            out.push((
-                full,
-                node.name.clone(),
-                false,
-                node.size.unwrap_or(0),
-                node.category.clone(),
-            ));
-        }
-    }
-
-    fn render_grid(&mut self, ui: &mut egui::Ui, root: &TreeNode, _parent: &str) {
-        let mut all: Vec<(String, String, bool, u64, Option<FileCategory>)> = Vec::new();
-        for child in &root.children {
-            self.collect_items(child, "", &mut all);
-        }
+    fn render_grid(&mut self, ui: &mut egui::Ui, root: &TreeNode) {
+        let directory = find_directory(root, &self.grid_path).unwrap_or(root);
+        let items: Vec<_> = directory
+            .children
+            .iter()
+            .map(|node| {
+                let full_path = if self.grid_path.is_empty() {
+                    node.name.clone()
+                } else {
+                    format!("{}/{}", self.grid_path, node.name)
+                };
+                (full_path, node)
+            })
+            .collect();
 
         // Breadcrumb
         ui.horizontal(|ui| {
             if !self.grid_path.is_empty() && ui.button("⬆ ..").clicked() {
-                self.grid_path.clear();
+                self.grid_path = self
+                    .grid_path
+                    .rsplit_once('/')
+                    .map_or_else(String::new, |(parent, _)| parent.to_owned());
             }
             let label = if self.grid_path.is_empty() {
                 "/ (root)"
@@ -1012,20 +1076,6 @@ impl App {
             ui.label(label);
         });
         ui.separator();
-
-        // Filter by current grid_path
-        let items: Vec<_> = if self.grid_path.is_empty() {
-            all.iter()
-                .filter(|(full, _, _, _, _)| !full.contains('/'))
-                .collect()
-        } else {
-            let prefix = format!("{}/", self.grid_path);
-            all.iter()
-                .filter(|(full, _, _, _, _)| {
-                    full.starts_with(&prefix) && !full[prefix.len()..].contains('/')
-                })
-                .collect()
-        };
 
         let mut card_rects: Vec<(egui::Rect, String)> = Vec::new();
 
@@ -1053,7 +1103,7 @@ impl App {
             let card_h = card_w * 0.92;
             let size = egui::vec2(card_w, card_h);
 
-            let mut chunk: Vec<&(String, String, bool, u64, Option<FileCategory>)> = Vec::new();
+            let mut chunk: Vec<&(String, &TreeNode)> = Vec::with_capacity(cols);
             for item in &items {
                 chunk.push(item);
                 if chunk.len() >= cols {
@@ -1113,14 +1163,14 @@ impl App {
     fn render_grid_row(
         &mut self,
         ui: &mut egui::Ui,
-        items: &[&(String, String, bool, u64, Option<FileCategory>)],
+        items: &[&(String, &TreeNode)],
         size: egui::Vec2,
         card_rects: &mut Vec<(egui::Rect, String)>,
         modifiers: egui::Modifiers,
     ) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            for (full_path, name, is_dir, file_size, category) in items {
+            for (full_path, node) in items {
                 let full = full_path.to_string();
                 let selected = self.arc.selected.contains(&full);
                 let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -1136,15 +1186,17 @@ impl App {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     ui.add_space(6.0);
                     ui.vertical_centered(|ui| {
-                        if *is_dir {
+                        if node.is_dir {
                             ui.label(egui::RichText::new("📁").size(28.0));
                         } else {
-                            ui.label(egui::RichText::new(cat_icon(category.as_ref())).size(28.0));
-                        }
-                        ui.label(egui::RichText::new(ellipsize(name, 16)).size(11.0));
-                        if !*is_dir {
                             ui.label(
-                                egui::RichText::new(format_size(*file_size))
+                                egui::RichText::new(cat_icon(node.category.as_ref())).size(28.0),
+                            );
+                        }
+                        ui.label(egui::RichText::new(ellipsize(&node.name, 16)).size(11.0));
+                        if !node.is_dir {
+                            ui.label(
+                                egui::RichText::new(format_size(node.size.unwrap_or(0)))
                                     .size(10.0)
                                     .weak(),
                             );
@@ -1152,7 +1204,7 @@ impl App {
                     });
                 });
                 if response.double_clicked() {
-                    if *is_dir {
+                    if node.is_dir {
                         self.grid_path = full;
                     } else {
                         self.extract_one(&full);
@@ -1251,44 +1303,65 @@ impl App {
             return;
         };
 
-        let all_files: Vec<String> = pack.list_files().iter().map(|s| s.to_string()).collect();
-        let mut ok = 0usize;
-        let mut fail = 0usize;
-
-        for path in &self.arc.selected.clone() {
-            let targets: Vec<String> = match pack.read_file(path) {
-                Ok(_) => vec![path.clone()],
-                Err(_) => all_files
+        let selected = self.arc.selected.clone();
+        let mut targets = std::collections::BTreeSet::new();
+        let mut directory_prefixes = Vec::new();
+        for path in selected {
+            if pack.contains_file(&path) {
+                targets.insert(path);
+            } else {
+                directory_prefixes.push(format!("{path}/"));
+            }
+        }
+        if !directory_prefixes.is_empty() {
+            for path in pack.iter_files() {
+                if directory_prefixes
                     .iter()
-                    .filter(|f| f.starts_with(&format!("{path}/")))
-                    .cloned()
-                    .collect(),
-            };
-            for file_path in &targets {
-                match pack.read_file(file_path) {
-                    Ok(data) => {
-                        let dest = out_dir.join(file_path);
-                        if let Some(parent) = dest.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        match std::fs::write(&dest, &data) {
-                            Ok(_) => ok += 1,
-                            Err(e) => {
-                                fail += 1;
-                                self.status = format!("Write error: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        fail += 1;
-                        self.status = format!("Read error: {e}");
-                    }
+                    .any(|prefix| path.starts_with(prefix))
+                {
+                    targets.insert(path.to_owned());
                 }
             }
         }
 
-        self.status = format!("Extracted {ok} files, {fail} failed");
         self.arc.selected.clear();
+        if targets.is_empty() {
+            self.status = "No files matched the selection.".into();
+            return;
+        }
+
+        self.busy = true;
+        self.status = "Extracting selected files…".into();
+        self.progress = (0, 0);
+        self.start = Some(Instant::now());
+        let pack = pack.clone();
+        let tracker = ProgressTracker::new();
+        let completion = tracker.clone();
+        self.tracker = Some(tracker);
+        self.worker = Some(std::thread::spawn(move || {
+            let mut ok = 0usize;
+            let mut fail = 0usize;
+            for file_path in targets {
+                let Some(destination) = safe_output_path(&out_dir, &file_path) else {
+                    fail += 1;
+                    continue;
+                };
+                let operation = pack.read_file(&file_path).and_then(|data| {
+                    if let Some(parent) = destination.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(destination, data)?;
+                    Ok(())
+                });
+                if operation.is_ok() {
+                    ok += 1;
+                } else {
+                    fail += 1;
+                }
+            }
+            completion.inner.lock().unwrap().2 = true;
+            Ok(format!("Extracted {ok} files, {fail} failed"))
+        }));
     }
 
     fn extract_all(&mut self) {
@@ -1318,7 +1391,7 @@ impl App {
         self.worker = Some(std::thread::spawn(move || {
             let result = crate::cmd::read::extract_all(&archive, &output, password.as_deref());
             clone.inner.lock().unwrap().2 = true;
-            result
+            result.map(|()| "Extraction complete.".into())
         }));
     }
 }

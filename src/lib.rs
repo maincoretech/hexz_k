@@ -14,7 +14,8 @@
 pub mod bench;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -36,7 +37,139 @@ mod archive {
 #[derive(Clone)]
 pub struct ResourcePack {
     archive: Arc<hexz_core::Archive>,
-    index: HashMap<String, (u64, usize)>,
+    index: Arc<PackIndex>,
+}
+
+struct PackIndex {
+    files: HashMap<String, FileEntry>,
+    root_prefix: Option<String>,
+}
+
+#[derive(Clone)]
+struct FileEntry {
+    offset: u64,
+    size: usize,
+}
+
+/// A resolved file handle for repeated or streaming reads.
+///
+/// Creating the handle performs the path lookup once. Cloning it is O(1), so
+/// host engines can retain handles for voice, music, textures, and scripts.
+#[derive(Clone)]
+pub struct ResourceFile {
+    archive: Arc<hexz_core::Archive>,
+    offset: u64,
+    size: usize,
+}
+
+impl ResourceFile {
+    /// Uncompressed file length in bytes.
+    pub const fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Return whether the file is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Read the complete file into a newly allocated vector.
+    pub fn read(&self) -> anyhow::Result<Vec<u8>> {
+        self.archive
+            .read_at(archive::ArchiveStream::Main, self.offset, self.size)
+            .map_err(Into::into)
+    }
+
+    /// Read a range into a newly allocated vector.
+    pub fn read_range(&self, offset: usize, length: usize) -> anyhow::Result<Vec<u8>> {
+        if offset > self.size {
+            anyhow::bail!("Range starts beyond end of resource file");
+        }
+        let length = length.min(self.size - offset);
+        self.archive
+            .read_at(
+                archive::ArchiveStream::Main,
+                self.checked_archive_offset(offset)?,
+                length,
+            )
+            .map_err(Into::into)
+    }
+
+    /// Read from the start of the file into a reusable buffer.
+    pub fn read_into(&self, buffer: &mut [u8]) -> anyhow::Result<usize> {
+        self.read_range_into(0, buffer)
+    }
+
+    /// Read a range into a reusable buffer and return the bytes written.
+    pub fn read_range_into(&self, offset: usize, buffer: &mut [u8]) -> anyhow::Result<usize> {
+        if offset > self.size {
+            anyhow::bail!("Range starts beyond end of resource file");
+        }
+        let length = buffer.len().min(self.size - offset);
+        if length == 0 {
+            return Ok(0);
+        }
+        self.archive.read_at_into(
+            archive::ArchiveStream::Main,
+            self.checked_archive_offset(offset)?,
+            &mut buffer[..length],
+        )?;
+        Ok(length)
+    }
+
+    fn checked_archive_offset(&self, offset: usize) -> anyhow::Result<u64> {
+        self.offset
+            .checked_add(offset as u64)
+            .ok_or_else(|| anyhow::anyhow!("Resource file offset overflow"))
+    }
+}
+
+/// Runtime tuning for archive reads.
+///
+/// The default values preserve the historical behavior of [`ResourcePack::open`].
+/// Game engines can select a bounded cache profile for predictable memory use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourcePackOptions {
+    /// Maximum number of decompressed blocks retained by the upstream cache.
+    /// `None` uses the upstream default (currently 1000 blocks).
+    pub cache_capacity_blocks: Option<usize>,
+    /// Number of logical blocks to prefetch after a read. `None` disables prefetching.
+    pub prefetch_window_blocks: Option<u32>,
+    /// Verify an encrypted password by reading the first byte while opening.
+    pub verify_password_on_open: bool,
+}
+
+impl Default for ResourcePackOptions {
+    fn default() -> Self {
+        Self {
+            cache_capacity_blocks: None,
+            prefetch_window_blocks: None,
+            verify_password_on_open: true,
+        }
+    }
+}
+
+impl ResourcePackOptions {
+    /// Memory-conscious profile for embedding in constrained host applications.
+    ///
+    /// At a typical 64 KiB block size, the decompressed block cache is bounded
+    /// to roughly 16 MiB, excluding cache metadata and variable-size blocks.
+    pub const fn memory_constrained() -> Self {
+        Self {
+            cache_capacity_blocks: Some(256),
+            prefetch_window_blocks: None,
+            verify_password_on_open: true,
+        }
+    }
+
+    /// High-throughput profile for asset-heavy host applications.
+    pub const fn high_throughput() -> Self {
+        Self {
+            cache_capacity_blocks: Some(1024),
+            prefetch_window_blocks: None,
+            verify_password_on_open: true,
+        }
+    }
 }
 
 /// Check whether an `.hxz` file is encrypted without fully opening it.
@@ -63,7 +196,7 @@ struct Metadata {
 }
 
 /// Human-readable file type classification based on extension.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum FileCategory {
     Image,
     Audio,
@@ -204,6 +337,15 @@ impl ResourcePack {
     /// If a password is provided, it will be used to decrypt the archive.
     /// Returns an error if the password is wrong or the archive is corrupted.
     pub fn open(path: impl AsRef<Path>, password: Option<&str>) -> anyhow::Result<Self> {
+        Self::open_with_options(path, password, ResourcePackOptions::default())
+    }
+
+    /// Open an archive with explicit cache and prefetch tuning.
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        password: Option<&str>,
+        options: ResourcePackOptions,
+    ) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let archive = if let Some(pw) = password {
             let header = Self::read_header(path)?;
@@ -212,23 +354,23 @@ impl ResourcePack {
                     archive::AesGcmEncryptor::new(pw.as_bytes(), &kp.salt, kp.iterations)
                         .map_err(|e| anyhow::anyhow!("Key derivation failed: {e}"))?,
                 );
-                let a = archive::hexz_store::open_local(path, Some(enc))
+                let a = Self::open_archive(path, Some(enc), options)
                     .map_err(|e| anyhow::anyhow!("Failed to open encrypted archive: {e}"))?;
                 // Verify password on first block
                 let size = a.size(archive::ArchiveStream::Main);
-                if size > 0 {
+                if options.verify_password_on_open && size > 0 {
                     a.read_at(archive::ArchiveStream::Main, 0, 1)
                         .map_err(|_| anyhow::anyhow!("Wrong password or corrupted archive"))?;
                 }
                 a
             } else {
-                archive::hexz_store::open_local(path, None::<Box<dyn archive::Encryptor>>)?
+                Self::open_archive(path, None, options)?
             }
         } else {
-            archive::hexz_store::open_local(path, None::<Box<dyn archive::Encryptor>>)?
+            Self::open_archive(path, None, options)?
         };
 
-        let index = Self::build_index(&archive)?;
+        let index = Arc::new(Self::build_index(&archive)?);
         Ok(Self { archive, index })
     }
 
@@ -237,26 +379,116 @@ impl ResourcePack {
     /// Path separators are normalised to `/`.  Returns the raw bytes
     /// of the file, or an error if the file is not found.
     pub fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>> {
-        let normalized = path.replace('\\', "/");
-        let (offset, size) = self
-            .index
-            .get(&normalized)
-            .or_else(|| {
-                self.index
-                    .iter()
-                    .find(|(k, _)| k.ends_with(&normalized))
-                    .map(|(_, v)| v)
-            })
+        let normalized = normalize_path(path);
+        let entry = self
+            .lookup_entry(&normalized)
             .ok_or_else(|| anyhow::anyhow!("File not found: {path}"))?;
 
         self.archive
-            .read_at(archive::ArchiveStream::Main, *offset, *size)
+            .read_at(archive::ArchiveStream::Main, entry.offset, entry.size)
             .map_err(Into::into)
+    }
+
+    /// Return whether a path identifies a file in the archive.
+    pub fn contains_file(&self, path: &str) -> bool {
+        let normalized = normalize_path(path);
+        self.lookup_entry(&normalized).is_some()
+    }
+
+    /// Resolve a path once for efficient repeated or streaming reads.
+    pub fn open_file(&self, path: &str) -> anyhow::Result<ResourceFile> {
+        let normalized = normalize_path(path);
+        let entry = self
+            .lookup_entry(&normalized)
+            .ok_or_else(|| anyhow::anyhow!("File not found: {path}"))?;
+        Ok(ResourceFile {
+            archive: Arc::clone(&self.archive),
+            offset: entry.offset,
+            size: entry.size,
+        })
+    }
+
+    /// Return the uncompressed size of a file.
+    pub fn file_size(&self, path: &str) -> Option<u64> {
+        let normalized = normalize_path(path);
+        self.lookup_entry(&normalized)
+            .map(|entry| entry.size as u64)
+    }
+
+    /// Read a byte range from a file without materializing the entire file.
+    pub fn read_file_range(
+        &self,
+        path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        let normalized = normalize_path(path);
+        let entry = self
+            .lookup_entry(&normalized)
+            .ok_or_else(|| anyhow::anyhow!("File not found: {path}"))?;
+        if offset > entry.size {
+            anyhow::bail!("Range starts beyond end of file: {path}");
+        }
+        let length = length.min(entry.size - offset);
+        let archive_offset = entry
+            .offset
+            .checked_add(offset as u64)
+            .ok_or_else(|| anyhow::anyhow!("File range overflow: {path}"))?;
+        self.archive
+            .read_at(archive::ArchiveStream::Main, archive_offset, length)
+            .map_err(Into::into)
+    }
+
+    /// Read a file into a reusable caller-provided buffer.
+    ///
+    /// Returns the number of bytes written. If the buffer is larger than the
+    /// file, its unused suffix is left unchanged.
+    pub fn read_file_into(&self, path: &str, buffer: &mut [u8]) -> anyhow::Result<usize> {
+        self.read_file_range_into(path, 0, buffer)
+    }
+
+    /// Read a file range into a reusable caller-provided buffer.
+    ///
+    /// Returns the number of bytes written. Reading at EOF returns zero.
+    pub fn read_file_range_into(
+        &self,
+        path: &str,
+        offset: usize,
+        buffer: &mut [u8],
+    ) -> anyhow::Result<usize> {
+        let normalized = normalize_path(path);
+        let entry = self
+            .lookup_entry(&normalized)
+            .ok_or_else(|| anyhow::anyhow!("File not found: {path}"))?;
+        if offset > entry.size {
+            anyhow::bail!("Range starts beyond end of file: {path}");
+        }
+        let length = buffer.len().min(entry.size - offset);
+        if length == 0 {
+            return Ok(0);
+        }
+        let archive_offset = entry
+            .offset
+            .checked_add(offset as u64)
+            .ok_or_else(|| anyhow::anyhow!("File range overflow: {path}"))?;
+        self.archive.read_at_into(
+            archive::ArchiveStream::Main,
+            archive_offset,
+            &mut buffer[..length],
+        )?;
+        Ok(length)
     }
 
     /// List all file paths in the archive.
     pub fn list_files(&self) -> Vec<&str> {
-        self.index.keys().map(|s| s.as_str()).collect()
+        let mut files: Vec<_> = self.index.files.keys().map(String::as_str).collect();
+        files.sort_unstable();
+        files
+    }
+
+    /// Iterate over file paths without allocating a temporary list.
+    pub fn iter_files(&self) -> impl Iterator<Item = &str> {
+        self.index.files.keys().map(String::as_str)
     }
 
     /// Raw size of the main stream data (includes all blocks).
@@ -282,17 +514,18 @@ impl ResourcePack {
             children: Vec::new(),
         };
 
-        // Collect and sort paths
-        let mut paths: Vec<&str> = self.index.keys().map(|s| s.as_str()).collect();
-        paths.sort_unstable();
-
-        for path in paths {
-            let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-            if parts.is_empty() {
-                continue;
-            }
-            Self::insert_into_tree(&mut root, &parts, self.index.get(path));
+        let mut children = BTreeMap::new();
+        for (path, entry) in &self.index.files {
+            Self::insert_tree_entry(
+                &mut children,
+                path.split('/').filter(|part| !part.is_empty()).peekable(),
+                entry,
+            );
         }
+        root.children = children
+            .into_iter()
+            .map(|(name, node)| node.into_tree_node(name))
+            .collect();
 
         // Remove root level if there's only one top-level dir
         if root.children.len() == 1 && root.children[0].is_dir {
@@ -302,43 +535,26 @@ impl ResourcePack {
         root
     }
 
-    fn insert_into_tree(node: &mut TreeNode, parts: &[&str], file_info: Option<&(u64, usize)>) {
-        if parts.is_empty() {
+    fn insert_tree_entry<'a, I>(
+        children: &mut BTreeMap<String, TreeBuilderNode>,
+        mut parts: std::iter::Peekable<I>,
+        file: &FileEntry,
+    ) where
+        I: Iterator<Item = &'a str>,
+    {
+        let Some(name) = parts.next() else {
+            return;
+        };
+        if parts.peek().is_none() {
+            children.insert(name.to_owned(), TreeBuilderNode::File(file.clone()));
             return;
         }
 
-        let name = parts[0].to_string();
-
-        if parts.len() == 1 {
-            // It's a file
-            let (_offset, size) = file_info.unwrap();
-            let category = FileCategory::from_path(&name);
-            node.children.push(TreeNode {
-                name,
-                is_dir: false,
-                size: Some(*size as u64),
-                category: Some(category),
-                children: Vec::new(),
-            });
-        } else {
-            // It's a directory
-            let child = node
-                .children
-                .iter_mut()
-                .find(|c| c.is_dir && c.name == name);
-            if let Some(dir) = child {
-                Self::insert_into_tree(dir, &parts[1..], file_info);
-            } else {
-                let mut new_dir = TreeNode {
-                    name: name.clone(),
-                    is_dir: true,
-                    size: None,
-                    category: None,
-                    children: Vec::new(),
-                };
-                Self::insert_into_tree(&mut new_dir, &parts[1..], file_info);
-                node.children.push(new_dir);
-            }
+        let node = children
+            .entry(name.to_owned())
+            .or_insert_with(|| TreeBuilderNode::Directory(BTreeMap::new()));
+        if let TreeBuilderNode::Directory(next) = node {
+            Self::insert_tree_entry(next, parts, file);
         }
     }
 
@@ -348,16 +564,17 @@ impl ResourcePack {
         let mut category_counts: HashMap<FileCategory, (usize, u64)> = HashMap::new();
         let mut total_size: u64 = 0;
 
-        for (_path, (_offset, size)) in &self.index {
-            let cat = FileCategory::from_path(_path);
-            let entry = category_counts.entry(cat).or_insert((0, 0));
+        for (path, file) in &self.index.files {
+            let entry = category_counts
+                .entry(FileCategory::from_path(path))
+                .or_insert((0, 0));
             entry.0 += 1;
-            entry.1 += *size as u64;
-            total_size += *size as u64;
+            entry.1 += file.size as u64;
+            total_size += file.size as u64;
         }
 
         PackMetadata {
-            total_files: self.index.len(),
+            total_files: self.index.files.len(),
             total_size,
             category_counts,
             file_tree: tree,
@@ -371,16 +588,126 @@ impl ResourcePack {
         Ok(bincode::deserialize(&bytes)?)
     }
 
-    fn build_index(archive: &hexz_core::Archive) -> anyhow::Result<HashMap<String, (u64, usize)>> {
+    fn open_archive(
+        path: &Path,
+        encryptor: Option<Box<dyn archive::Encryptor>>,
+        options: ResourcePackOptions,
+    ) -> anyhow::Result<Arc<hexz_core::Archive>> {
+        archive::hexz_store::open_local_with_cache(
+            path,
+            encryptor,
+            options.cache_capacity_blocks,
+            options.prefetch_window_blocks,
+        )
+        .map_err(Into::into)
+    }
+
+    fn build_index(archive: &hexz_core::Archive) -> anyhow::Result<PackIndex> {
         let meta_bytes = archive
             .metadata
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No metadata in archive"))?;
         let meta: Metadata = serde_json::from_slice(meta_bytes)?;
-        let mut idx = HashMap::new();
-        for f in &meta.files {
-            idx.insert(f.path.replace('\\', "/"), (f.offset, f.size as usize));
+        let mut index = HashMap::with_capacity(meta.files.len());
+        for file in meta.files {
+            let path = file.path.replace('\\', "/");
+            let size = usize::try_from(file.size)
+                .map_err(|_| anyhow::anyhow!("File is too large for this platform: {path}"))?;
+            index.insert(
+                path,
+                FileEntry {
+                    offset: file.offset,
+                    size,
+                },
+            );
         }
-        Ok(idx)
+        let root_prefix = common_root_prefix(index.keys().map(String::as_str));
+        Ok(PackIndex {
+            files: index,
+            root_prefix,
+        })
+    }
+
+    fn lookup_entry(&self, normalized: &str) -> Option<&FileEntry> {
+        self.index.files.get(normalized).or_else(|| {
+            let prefix = self.index.root_prefix.as_deref()?;
+            let path = format!("{prefix}/{normalized}");
+            self.index.files.get(&path)
+        })
+    }
+}
+
+enum TreeBuilderNode {
+    Directory(BTreeMap<String, TreeBuilderNode>),
+    File(FileEntry),
+}
+
+impl TreeBuilderNode {
+    fn into_tree_node(self, name: String) -> TreeNode {
+        match self {
+            Self::Directory(children) => TreeNode {
+                name,
+                is_dir: true,
+                size: None,
+                category: None,
+                children: children
+                    .into_iter()
+                    .map(|(name, node)| node.into_tree_node(name))
+                    .collect(),
+            },
+            Self::File(file) => TreeNode {
+                category: Some(FileCategory::from_path(&name)),
+                name,
+                is_dir: false,
+                size: Some(file.size as u64),
+                children: Vec::new(),
+            },
+        }
+    }
+}
+
+fn normalize_path(path: &str) -> Cow<'_, str> {
+    if path.contains('\\') {
+        Cow::Owned(path.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
+fn common_root_prefix<'a>(mut paths: impl Iterator<Item = &'a str>) -> Option<String> {
+    let first = paths.next()?;
+    let (root, _) = first.split_once('/')?;
+    if root.is_empty()
+        || !paths.all(|path| path.split_once('/').is_some_and(|(head, _)| head == root))
+    {
+        return None;
+    }
+    Some(root.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn resource_handles_are_thread_safe_and_lightweight() {
+        assert_send_sync::<ResourcePack>();
+        assert_send_sync::<ResourceFile>();
+        assert_eq!(
+            std::mem::size_of::<ResourcePack>(),
+            2 * std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn integration_profiles_have_bounded_caches() {
+        let constrained = ResourcePackOptions::memory_constrained();
+        let throughput = ResourcePackOptions::high_throughput();
+        assert_eq!(constrained.cache_capacity_blocks, Some(256));
+        assert_eq!(throughput.cache_capacity_blocks, Some(1024));
+        assert!(constrained.prefetch_window_blocks.is_none());
+        assert!(throughput.prefetch_window_blocks.is_none());
     }
 }

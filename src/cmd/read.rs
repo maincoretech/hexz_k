@@ -11,9 +11,7 @@ pub fn list_files(archive_path: &str, password: Option<&str>) -> anyhow::Result<
     println!("Archive: {}", archive_path);
     println!("  Size: {:.2} MB", pack.main_size() as f64 / 1_048_576.0);
     println!("  Files: {}", files.len());
-    let mut sorted: Vec<_> = files.iter().collect();
-    sorted.sort();
-    for path in &sorted {
+    for path in files {
         println!("  {path}");
     }
     Ok(())

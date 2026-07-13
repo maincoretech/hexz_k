@@ -12,6 +12,27 @@ cargo build --release
 cargo build --release --features gui
 ```
 
+When embedding the resource backend into another project, depend on the library
+without CLI/GUI dependencies:
+
+```toml
+hexz_k = { version = "0.2", default-features = false }
+```
+
+```rust,no_run
+use hexz_k::{ResourcePack, ResourcePackOptions};
+
+let pack = ResourcePack::open_with_options(
+    "game.hxz",
+    None,
+    ResourcePackOptions::memory_constrained(),
+)?;
+let file = pack.open_file("scenario/scene-0001.txt")?;
+let mut buffer = vec![0; file.len()];
+let bytes_read = file.read_into(&mut buffer)?;
+# Ok::<(), anyhow::Error>(())
+```
+
 ## Commands
 
 | Command | Description |
@@ -45,21 +66,22 @@ hexz read game.hxz bgm/bgm1.webm --output bgm1.webm  # save to file
 hexz extract game.hxz --output ./out                 # extract all
 
 # ── Benchmark ──
-hexz bench                                           # 32 MiB, 3-round avg
+hexz bench                                           # 28 MiB mixed assets, 3-round avg
 ```
 
 ## Benchmark
 
-`hexz bench` generates 32 MiB of lorem-ipsum text, packs it in-process
-with LZ4 and Zstd, then measures sequential read throughput and random
-IOPS over 3 rounds.  Results reflect IO-bound performance; temp files
-are cleaned up automatically.
+`hexz bench` generates a 28 MiB visual-novel/game workload containing 624
+scenario, background, voice, and UI assets. It packs them in-process with
+LZ4 and Zstd, then measures sequential throughput and allocation-free random
+4 KiB range-read IOPS over 3 rounds. Input data and benchmark archives use
+separate directories, and temp files are cleaned up automatically.
 
 Example output:
 
 ```text
-  lz4 64KiB: pack    26ms   53.8 KiB  609.5x  |  seq  32003.9 MB/s  |  IOPS  1705
-  zstd 64KiB: pack    20ms   45.0 KiB  727.6x  |  seq  32056.4 MB/s  |  IOPS  2632
+  lz4 64KiB: pack   180ms  24999.6 KiB   1.1x  |  seq  1325.1 MB/s  |  IOPS  640016
+  zstd 64KiB: pack   180ms  24881.9 KiB   1.2x  |  seq  1252.9 MB/s  |  IOPS  459199
 ```
 
 ## Architecture
