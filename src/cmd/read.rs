@@ -1,7 +1,7 @@
 //! Read/list/extract/show/preview — thin wrappers over hexz_k public API.
 
+use crate::ResourcePack;
 use anyhow::Context;
-use hexz_k::ResourcePack;
 use std::io::Write;
 
 /// List all files in an archive.
@@ -44,14 +44,10 @@ pub fn extract_all(
     output_dir: &str,
     password: Option<&str>,
 ) -> anyhow::Result<()> {
-    use hexz_ops::pack::extract_archive;
+    let pack = ResourcePack::open(archive_path, password)?;
     println!("Extracting {} -> {}", archive_path, output_dir);
-    extract_archive(
-        archive_path.as_ref(),
-        output_dir.as_ref(),
-        password.map(|s| s.to_string()),
-    )
-    .context("Failed to extract archive")?;
+    pack.extract_to_dir(std::path::Path::new(output_dir))
+        .context("Failed to extract archive")?;
     println!("Done.");
     Ok(())
 }
@@ -126,8 +122,8 @@ pub fn preview_files(archive_path: &str, json: bool, password: Option<&str>) -> 
             info.block_size / 1024
         );
         println!("  Encrypted: {}", info.features.encrypted);
-        println!("  On-disk:  {}", hexz_k::format_size(info.file_size));
-        println!("  Unpacked: {}", hexz_k::format_size(meta.total_size));
+        println!("  On-disk:  {}", crate::format_size(info.file_size));
+        println!("  Unpacked: {}", crate::format_size(meta.total_size));
         println!("  Ratio: {:.2}x", info.compression_ratio());
         println!("  Files: {}", meta.total_files);
 
@@ -145,7 +141,7 @@ pub fn preview_files(archive_path: &str, json: bool, password: Option<&str>) -> 
                 "    {:<10} {:>5} files  {:>10}  ({:>4.0}%)",
                 format!("{cat}:"),
                 count,
-                hexz_k::format_size(*size),
+                crate::format_size(*size),
                 pct,
             );
         }

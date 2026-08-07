@@ -262,6 +262,51 @@ fn extract_all() {
     cleanup(&dir);
 }
 
+#[test]
+#[cfg(unix)]
+fn extract_restores_mode_and_mtime() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let dir = setup_temp_dir();
+    let archive = dir.join("meta.hxz");
+    let bin = hexz_bin();
+
+    // A script with non-default permissions and a fixed modification time.
+    let script = dir.join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o751)).unwrap();
+    let stamp = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    std::fs::File::open(&script)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(stamp))
+        .unwrap();
+
+    let out = Command::new(&bin)
+        .args(["pack", dir.to_str().unwrap(), archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "pack failed: {:?}", out);
+
+    let out_dir = dir.join("extracted");
+    let out = Command::new(&bin)
+        .args([
+            "extract",
+            archive.to_str().unwrap(),
+            "--output",
+            out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "extract failed: {:?}", out);
+
+    let meta = std::fs::metadata(out_dir.join("run.sh")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o751);
+    assert_eq!(meta.modified().unwrap(), stamp);
+
+    cleanup(&dir);
+}
+
 // ── Show ──
 
 #[test]

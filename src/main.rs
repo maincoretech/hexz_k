@@ -7,7 +7,7 @@
 
 use clap::{Parser, Subcommand};
 
-mod cmd;
+use hexz_k::cmd;
 
 #[derive(Parser)]
 #[command(name = "hexz", about = "hexz archive CLI for game resource packs")]

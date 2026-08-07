@@ -2,8 +2,8 @@
 //!
 //! Invoked via `hexz bench`.
 
+use crate::bench;
 use crate::cmd::pack::{self, PackOptions};
-use hexz_k::bench;
 use std::time::Instant;
 
 /// Run the full benchmark: generate data, pack, measure reads.

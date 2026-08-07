@@ -13,11 +13,18 @@
 /// Shared benchmark data generators and measurement functions.
 pub mod bench;
 
+/// Command implementations exposed as a library. `pack` gives embedding
+/// applications the directory→archive packer without the interactive CLI
+/// dependencies; `cli` additionally builds the read/list commands.
+#[cfg(any(feature = "cli", feature = "pack"))]
+pub mod cmd;
+
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 mod archive {
@@ -49,6 +56,11 @@ struct PackIndex {
 struct FileEntry {
     offset: u64,
     size: usize,
+    /// POSIX permission bits recorded by the packer (`None` for legacy
+    /// manifests that predate per-file metadata).
+    mode: Option<u32>,
+    /// Last modification time as Unix seconds (`None` for legacy manifests).
+    mtime: Option<u64>,
 }
 
 /// A resolved file handle for repeated or streaming reads.
@@ -188,6 +200,10 @@ struct MetaFile {
     path: String,
     offset: u64,
     size: u64,
+    #[serde(default)]
+    mode: Option<u32>,
+    #[serde(default)]
+    mtime: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -479,6 +495,51 @@ impl ResourcePack {
         Ok(length)
     }
 
+    /// Write one archive member to `destination`, restoring the recorded
+    /// permission bits and modification time when the manifest carries them.
+    pub fn extract_file_to(&self, path: &str, destination: &Path) -> anyhow::Result<()> {
+        let normalized = normalize_path(path);
+        let entry = self
+            .lookup_entry(&normalized)
+            .ok_or_else(|| anyhow::anyhow!("File not found: {path}"))?;
+        let data = self
+            .archive
+            .read_at(archive::ArchiveStream::Main, entry.offset, entry.size)?;
+        write_extracted(destination, &data, entry.mode, entry.mtime)?;
+        Ok(())
+    }
+
+    /// Extract every archive member into `output_dir`, preserving the archive
+    /// layout. Member paths that would escape the output root (absolute or
+    /// containing `..`) are rejected, and extraction stops at the first error.
+    pub fn extract_to_dir(&self, output_dir: &Path) -> anyhow::Result<()> {
+        std::fs::create_dir_all(output_dir).with_context(|| {
+            format!(
+                "Failed to create output directory: {}",
+                output_dir.display()
+            )
+        })?;
+        for (path, entry) in &self.index.files {
+            self.write_member(output_dir, path, entry)
+                .with_context(|| format!("Failed to extract member: {path}"))?;
+        }
+        Ok(())
+    }
+
+    fn write_member(&self, output_dir: &Path, path: &str, entry: &FileEntry) -> anyhow::Result<()> {
+        let relative =
+            safe_member_path(path).ok_or_else(|| anyhow::anyhow!("Unsafe member path: {path}"))?;
+        let destination = output_dir.join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let data = self
+            .archive
+            .read_at(archive::ArchiveStream::Main, entry.offset, entry.size)?;
+        write_extracted(&destination, &data, entry.mode, entry.mtime)?;
+        Ok(())
+    }
+
     /// List all file paths in the archive.
     pub fn list_files(&self) -> Vec<&str> {
         let mut files: Vec<_> = self.index.files.keys().map(String::as_str).collect();
@@ -618,6 +679,8 @@ impl ResourcePack {
                 FileEntry {
                     offset: file.offset,
                     size,
+                    mode: file.mode,
+                    mtime: file.mtime,
                 },
             );
         }
@@ -685,6 +748,58 @@ fn common_root_prefix<'a>(mut paths: impl Iterator<Item = &'a str>) -> Option<St
     Some(root.to_owned())
 }
 
+/// Resolve a manifest path to a safe relative path. Absolute paths and any
+/// `..` components are rejected so extraction cannot escape the output root.
+fn safe_member_path(path: &str) -> Option<&Path> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    path.components()
+        .all(|component| matches!(component, Component::Normal(_)))
+        .then_some(path)
+}
+
+fn write_extracted(
+    destination: &Path,
+    data: &[u8],
+    mode: Option<u32>,
+    mtime: Option<u64>,
+) -> std::io::Result<()> {
+    std::fs::write(destination, data)?;
+    if let Some(mode) = mode {
+        apply_mode(destination, mode)?;
+    }
+    if let Some(mtime) = mtime {
+        apply_mtime(destination, mtime)?;
+    }
+    Ok(())
+}
+
+/// Restore the permission bits recorded by the packer. A zero mode is treated
+/// as "not recorded" so extracted files never become unreadable.
+#[cfg(unix)]
+fn apply_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = mode & 0o7777;
+    if mode == 0 {
+        return Ok(());
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn apply_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Restore the recorded modification time as a whole-second Unix timestamp.
+fn apply_mtime(path: &Path, mtime: u64) -> std::io::Result<()> {
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime);
+    let times = std::fs::FileTimes::new().set_modified(modified);
+    std::fs::File::open(path)?.set_times(times)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,5 +824,21 @@ mod tests {
         assert_eq!(throughput.cache_capacity_blocks, Some(1024));
         assert!(constrained.prefetch_window_blocks.is_none());
         assert!(throughput.prefetch_window_blocks.is_none());
+    }
+
+    #[test]
+    fn safe_member_path_rejects_escape_attempts() {
+        assert_eq!(
+            safe_member_path("bgm/theme.ogg").map(Path::to_path_buf),
+            Some(std::path::PathBuf::from("bgm/theme.ogg"))
+        );
+        // `components()` normalizes `.` and `//` away, which cannot escape the root.
+        assert!(safe_member_path("a/./b").is_some());
+        for unsafe_path in ["../secret", "a/../../secret", "..", "/etc/passwd", "", "."] {
+            assert!(
+                safe_member_path(unsafe_path).is_none(),
+                "path must be rejected: {unsafe_path:?}"
+            );
+        }
     }
 }

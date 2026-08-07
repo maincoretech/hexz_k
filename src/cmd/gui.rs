@@ -3,7 +3,7 @@
 #![allow(clippy::collapsible_if)]
 
 use crate::cmd::pack::{self, PackOptions, ProgressTracker};
-use hexz_k::{FileCategory, PackMetadata, ResourcePack, TreeNode, bench, format_size};
+use crate::{FileCategory, PackMetadata, ResourcePack, TreeNode, bench, format_size};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -47,6 +47,41 @@ fn ellipsize(s: &str, max: usize) -> String {
     }
 }
 
+/// Button sized to match the adjacent text-edit row height.
+fn row_button(text: impl Into<egui::WidgetText>, height: f32) -> egui::Button<'static> {
+    egui::Button::new(text).min_size(egui::vec2(0.0, height))
+}
+
+/// Password field that fades in/out with its `visible` flag and matches the
+/// row height of the surrounding text edits.
+fn password_field(
+    ui: &mut egui::Ui,
+    visible: bool,
+    password: &mut String,
+    id: &'static str,
+    row_h: f32,
+) {
+    let fade = ui
+        .ctx()
+        .animate_bool(egui::Id::new(("password", id)), visible);
+    if visible || fade > 0.0 {
+        // Keep repainting while the fade settles; the first frame after the
+        // flag flips may still read `fade == 0.0`.
+        if fade < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        ui.scope(|ui| {
+            ui.multiply_opacity(fade);
+            ui.add_sized(
+                [120.0, row_h],
+                egui::TextEdit::singleline(password)
+                    .password(true)
+                    .hint_text("password"),
+            );
+        });
+    }
+}
+
 fn cat_icon(c: Option<&FileCategory>) -> &str {
     match c {
         Some(FileCategory::Image) => "🖼",
@@ -84,6 +119,17 @@ fn safe_output_path(root: &std::path::Path, archive_path: &str) -> Option<std::p
     } else {
         None
     }
+}
+
+fn confirm_overwrite(count: usize) -> bool {
+    rfd::MessageDialog::new()
+        .set_title("Overwrite existing files")
+        .set_description(format!(
+            "{count} file(s) already exist in the destination. Overwrite them?"
+        ))
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        == rfd::MessageDialogResult::Yes
 }
 
 // ── entry point ───────────────────────────────────────────────────────────
@@ -132,7 +178,7 @@ pub fn run_gui() -> anyhow::Result<()> {
 
 // ── state ────────────────────────────────────────────────────────────────
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Pack,
     Browse,
@@ -205,6 +251,9 @@ struct BenchProgress {
 
 struct App {
     tab: Tab,
+    active_tab: Tab,
+    tab_fade: f32,
+    show_about: bool,
     browse_mode: BrowseMode,
     grid_skip_frames: u8,
     grid_path: String,
@@ -228,6 +277,9 @@ impl Default for App {
     fn default() -> Self {
         Self {
             tab: Tab::Pack,
+            active_tab: Tab::Pack,
+            tab_fade: 0.0,
+            show_about: false,
             browse_mode: BrowseMode::List,
             grid_skip_frames: 0,
             grid_path: String::new(),
@@ -265,20 +317,42 @@ impl eframe::App for App {
 
         // header
         egui::TopBottomPanel::top("head")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
+                    left: 8,
+                    right: 8,
+                    top: 6,
+                    bottom: 4,
+                }),
+            )
             .min_height(28.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("hexz_k");
+                    ui.selectable_value(&mut self.tab, Tab::Pack, "  Pack  ");
+                    ui.selectable_value(&mut self.tab, Tab::Browse, " Browse ");
+                    ui.selectable_value(&mut self.tab, Tab::Bench, " Bench ");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.selectable_value(&mut self.tab, Tab::Bench, " Bench ");
-                        ui.selectable_value(&mut self.tab, Tab::Browse, " Browse ");
-                        ui.selectable_value(&mut self.tab, Tab::Pack, "  Pack  ");
+                        if ui.button("About").clicked() {
+                            self.show_about = true;
+                        }
                     });
                 });
             });
 
+        // Fade the active page in on tab switches; runs after the header so
+        // the click that changes `self.tab` starts the fade in the same frame.
+        if self.active_tab != self.tab {
+            self.active_tab = self.tab;
+            self.tab_fade = 0.0;
+        }
+        if self.tab_fade < 1.0 {
+            let dt = ctx.input(|i| i.stable_dt).min(0.05);
+            self.tab_fade = (self.tab_fade + dt * 8.0).min(1.0);
+        }
+
         // main
         egui::CentralPanel::default().show(ctx, |ui| {
+            ui.multiply_opacity(self.tab_fade);
             ui.add_enabled_ui(!self.busy, |ui| match self.tab {
                 Tab::Pack => self.pack_page(ui),
                 Tab::Browse => self.browse_page(ui, load_trigger),
@@ -286,36 +360,115 @@ impl eframe::App for App {
             });
         });
 
-        // status bar
+        // status bar: action buttons + status text, progress bars below.
+        let pack_ok = !self.form.input.is_empty()
+            && !self.form.output.is_empty()
+            && (!self.form.encrypt || !self.form.password.is_empty());
         egui::TopBottomPanel::bottom("status")
-            .min_height(22.0)
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(8, 6)),
+            )
+            .min_height(32.0)
             .show(ctx, |ui| {
-                if self.busy {
-                    self.render_busy_status(ui);
-                } else {
-                    let mut line = String::new();
-                    if let Some(ref meta) = self.arc.meta {
-                        let ratio = if self.arc.file_size > 0 {
-                            meta.total_size as f64 / self.arc.file_size as f64
-                        } else {
-                            1.0
-                        };
-                        line.push_str(&format!(
-                            "{} files | {} disk → {} | {:.1}x | ",
-                            meta.total_files,
-                            format_size(self.arc.file_size),
-                            format_size(meta.total_size),
-                            ratio,
-                        ));
+                ui.horizontal(|ui| {
+                    ui.scope(|ui| {
+                        ui.multiply_opacity(self.tab_fade);
+                        match self.tab {
+                            Tab::Pack => {
+                                if ui
+                                    .add_enabled(pack_ok && !self.busy, egui::Button::new("Pack"))
+                                    .clicked()
+                                {
+                                    self.do_pack();
+                                }
+                            }
+                            Tab::Browse => {
+                                if ui
+                                    .add_enabled(
+                                        !self.arc.path.is_empty() && !self.busy,
+                                        egui::Button::new("Load"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.open_archive();
+                                }
+                            }
+                            Tab::Bench => {
+                                if ui
+                                    .add_enabled(
+                                        !self.bench_running && !self.busy,
+                                        egui::Button::new("Run"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_bench();
+                                }
+                            }
+                        }
+                    });
+                    ui.separator();
+                    if self.busy {
+                        self.render_busy_status(ui);
+                    } else if self.bench_running {
+                        self.render_bench_progress(ui);
+                    } else {
+                        let mut line = String::new();
+                        if let Some(ref meta) = self.arc.meta {
+                            let ratio = if self.arc.file_size > 0 {
+                                meta.total_size as f64 / self.arc.file_size as f64
+                            } else {
+                                1.0
+                            };
+                            line.push_str(&format!(
+                                "{} files | {} disk → {} | {:.1}x | ",
+                                meta.total_files,
+                                format_size(self.arc.file_size),
+                                format_size(meta.total_size),
+                                ratio,
+                            ));
+                        }
+                        line.push_str(&self.status);
+                        ui.label(line);
                     }
-                    line.push_str(&self.status);
-                    ui.label(line);
-                }
+                });
             });
 
         if self.busy || self.bench_running {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        if self.tab_fade < 1.0 {
+            ctx.request_repaint();
+        }
+
+        // About is always rendered so egui can play its built-in fade-out
+        // when the Close button (or the shared flag) closes it.
+        let mut show_about = self.show_about;
+        let mut close_clicked = false;
+        egui::Window::new("About hexz_k")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(260.0)
+            .default_height(0.0)
+            .open(&mut show_about)
+            .show(ctx, |ui| {
+                ui.label("hexz_k");
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.hyperlink("https://github.com/maincoretech/hexz_k");
+                ui.label("hexz archive tool for game resource packs");
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+                    if ui.button("Close").clicked() {
+                        close_clicked = true;
+                    }
+                });
+            });
+        if close_clicked {
+            show_about = false;
+        }
+        self.show_about = show_about;
     }
 }
 
@@ -339,10 +492,11 @@ impl App {
             }
             Ok(Err(error)) => {
                 let message = error.to_string();
-                if message.contains("encrypt")
+                let needs_key = crate::is_encrypted(&self.arc.path).unwrap_or(false)
+                    || message.contains("encrypt")
                     || message.contains("password")
-                    || message.contains("auth")
-                {
+                    || message.contains("auth");
+                if needs_key {
                     self.arc.encrypted = true;
                     self.arc.error = Some("Wrong password or encrypted — check Key.".into());
                 } else {
@@ -421,7 +575,7 @@ impl App {
                 [w.max(60.0), row_h],
                 egui::TextEdit::singleline(&mut self.form.input).hint_text("source directory…"),
             );
-            if ui.button("…").clicked() {
+            if ui.add(row_button("…", row_h)).clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.form.input = path.display().to_string();
                 }
@@ -436,7 +590,7 @@ impl App {
                 [w.max(60.0), row_h],
                 egui::TextEdit::singleline(&mut self.form.output).hint_text("output.hxz…"),
             );
-            if ui.button("…").clicked() {
+            if ui.add(row_button("…", row_h)).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("Hexz", &["hxz"])
                     .save_file()
@@ -452,31 +606,17 @@ impl App {
             ui.selectable_value(&mut self.form.compression, 1, "Zstd");
             ui.selectable_value(&mut self.form.compression, 0, "LZ4");
             ui.separator();
-            ui.checkbox(&mut self.form.encrypt, "AES-256");
-            if self.form.encrypt {
-                ui.add_sized(
-                    [120.0, row_h],
-                    egui::TextEdit::singleline(&mut self.form.password)
-                        .password(true)
-                        .hint_text("password"),
-                );
-            }
-        });
-
-        ui.add_space(24.0);
-
-        // Pack button
-        ui.horizontal_centered(|ui| {
-            let ok = !self.form.input.is_empty()
-                && !self.form.output.is_empty()
-                && (!self.form.encrypt || !self.form.password.is_empty());
-            let button = ui.add_enabled(
-                ok,
-                egui::Button::new("Pack Archive").min_size([160.0, 30.0].into()),
+            ui.add_sized(
+                [0.0, row_h],
+                egui::Checkbox::new(&mut self.form.encrypt, "AES-256"),
             );
-            if button.clicked() {
-                self.do_pack();
-            }
+            password_field(
+                ui,
+                self.form.encrypt,
+                &mut self.form.password,
+                "pack",
+                row_h,
+            );
         });
     }
 
@@ -515,137 +655,132 @@ impl App {
     fn bench_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Benchmark");
 
-        let can_run = !self.bench_running;
-        if ui
-            .add_enabled(can_run, egui::Button::new("▶ Run Full Benchmark"))
-            .clicked()
-        {
-            self.bench_running = true;
-            self.bench_results.lock().unwrap().clear();
-            *self.bench_progress.lock().unwrap() = BenchProgress {
-                step: 0,
-                total: bench::GAME_BENCH_GROUPS.len() + bench::BENCH_CONFIGS.len() + 1,
-                msg: "Generating test data…".into(),
-            };
-            let results = self.bench_results.clone();
-            let progress = self.bench_progress.clone();
-            std::thread::spawn(move || {
-                let tmp = std::env::temp_dir().join("hexz_gui_bench");
-                let _ = std::fs::remove_dir_all(&tmp);
-                let _ = std::fs::create_dir_all(&tmp);
-                let input_dir = tmp.join("input");
-                let output_dir = tmp.join("output");
-                let _ = std::fs::create_dir_all(&input_dir);
-                let _ = std::fs::create_dir_all(&output_dir);
-
-                // Step 0: generate
-                {
-                    let mut p = progress.lock().unwrap();
-                    p.step = 0;
-                    p.total = bench::GAME_BENCH_GROUPS.len() + bench::BENCH_CONFIGS.len() + 1;
-                    p.msg = "Generating test data…".into();
-                }
-                let total = match bench::generate_game_test_files(&input_dir) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let mut p = progress.lock().unwrap();
-                        p.msg = format!("Data generation failed: {e}");
-                        p.step = p.total;
-                        return;
-                    }
-                };
-
-                for (i, (comp, bs)) in bench::BENCH_CONFIGS.iter().enumerate() {
-                    let step = bench::GAME_BENCH_GROUPS.len() + i + 1;
-                    let total_steps =
-                        bench::GAME_BENCH_GROUPS.len() + bench::BENCH_CONFIGS.len() + 1;
-                    {
-                        let mut p = progress.lock().unwrap();
-                        p.step = step;
-                        p.total = total_steps;
-                        p.msg = format!("Packing {comp} {}KiB…", bs / 1024);
-                    }
-
-                    let label = format!("{comp} {}KiB", bs / 1024);
-                    let archive = output_dir.join(format!("bench_{comp}_{bs}.hxz"));
-
-                    const ROUNDS: usize = 3;
-                    let mut sum_pack = 0u128;
-                    let mut sum_seq = 0f64;
-                    let mut sum_iops = 0f64;
-
-                    for _ in 0..ROUNDS {
-                        let t0 = Instant::now();
-                        let opts = crate::cmd::pack::PackOptions {
-                            input: input_dir.to_string_lossy().to_string(),
-                            output: archive.to_string_lossy().to_string(),
-                            compression: comp.to_string(),
-                            encrypt: false,
-                            block_size: *bs,
-                            password: None,
-                        };
-                        if crate::cmd::pack::pack_directory(&opts).is_err() {
-                            break; // skip remaining rounds on pack failure
-                        }
-                        sum_pack += t0.elapsed().as_millis();
-
-                        // Use shared measurement (same as CLI bench)
-                        if let Ok((seq, iops)) = bench::measure_reads(&archive) {
-                            sum_seq += seq;
-                            sum_iops += iops;
-                        }
-                    }
-
-                    let archive_sz = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(1);
-                    let entry = BenchEntry {
-                        label: label.clone(),
-                        pack_ms: if ROUNDS > 0 {
-                            sum_pack / ROUNDS as u128
-                        } else {
-                            0
-                        },
-                        ratio: total as f64 / archive_sz as f64,
-                        seq_mbps: sum_seq / ROUNDS as f64,
-                        iops: sum_iops / ROUNDS as f64,
-                    };
-
-                    {
-                        let mut out = results.lock().unwrap();
-                        out.push(entry);
-                    }
-                }
-
-                let _ = std::fs::remove_dir_all(&tmp);
-                let mut p = progress.lock().unwrap();
-                p.step = p.total;
-                p.msg = "Done.".into();
-            });
-        }
-
-        // Progress
-        if self.bench_running {
-            // Use try_lock to never block the UI
-            if let Ok(p) = self.bench_progress.try_lock() {
-                if p.total > 0 {
-                    let frac = p.step as f32 / p.total as f32;
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .text(format!("{}/{}  {}", p.step, p.total, p.msg)),
-                    );
-                } else {
-                    ui.label(&p.msg);
-                }
-                if p.step >= p.total && p.total > 0 {
-                    self.bench_running = false;
-                }
-            }
-        }
-
         // Results + chart — also use try_lock
         if let Ok(entries) = self.bench_results.try_lock() {
             if !entries.is_empty() {
                 ui.separator();
                 self.draw_bench_chart(ui, &entries);
+            }
+        }
+    }
+
+    fn start_bench(&mut self) {
+        self.bench_running = true;
+        self.bench_results.lock().unwrap().clear();
+        *self.bench_progress.lock().unwrap() = BenchProgress {
+            step: 0,
+            total: bench::GAME_BENCH_GROUPS.len() + bench::BENCH_CONFIGS.len() + 1,
+            msg: "Generating test data…".into(),
+        };
+        let results = self.bench_results.clone();
+        let progress = self.bench_progress.clone();
+        std::thread::spawn(move || {
+            let tmp = std::env::temp_dir().join("hexz_gui_bench");
+            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::create_dir_all(&tmp);
+            let input_dir = tmp.join("input");
+            let output_dir = tmp.join("output");
+            let _ = std::fs::create_dir_all(&input_dir);
+            let _ = std::fs::create_dir_all(&output_dir);
+
+            // Step 0: generate
+            {
+                let mut p = progress.lock().unwrap();
+                p.step = 0;
+                p.total = bench::GAME_BENCH_GROUPS.len() + bench::BENCH_CONFIGS.len() + 1;
+                p.msg = "Generating test data…".into();
+            }
+            let total = match bench::generate_game_test_files(&input_dir) {
+                Ok(t) => t,
+                Err(e) => {
+                    let mut p = progress.lock().unwrap();
+                    p.msg = format!("Data generation failed: {e}");
+                    p.step = p.total;
+                    return;
+                }
+            };
+
+            for (i, (comp, bs)) in bench::BENCH_CONFIGS.iter().enumerate() {
+                let step = bench::GAME_BENCH_GROUPS.len() + i + 1;
+                let total_steps = bench::GAME_BENCH_GROUPS.len() + bench::BENCH_CONFIGS.len() + 1;
+                {
+                    let mut p = progress.lock().unwrap();
+                    p.step = step;
+                    p.total = total_steps;
+                    p.msg = format!("Packing {comp} {}KiB…", bs / 1024);
+                }
+
+                let label = format!("{comp} {}KiB", bs / 1024);
+                let archive = output_dir.join(format!("bench_{comp}_{bs}.hxz"));
+
+                const ROUNDS: usize = 3;
+                let mut sum_pack = 0u128;
+                let mut sum_seq = 0f64;
+                let mut sum_iops = 0f64;
+
+                for _ in 0..ROUNDS {
+                    let t0 = Instant::now();
+                    let opts = crate::cmd::pack::PackOptions {
+                        input: input_dir.to_string_lossy().to_string(),
+                        output: archive.to_string_lossy().to_string(),
+                        compression: comp.to_string(),
+                        encrypt: false,
+                        block_size: *bs,
+                        password: None,
+                    };
+                    if crate::cmd::pack::pack_directory(&opts).is_err() {
+                        break; // skip remaining rounds on pack failure
+                    }
+                    sum_pack += t0.elapsed().as_millis();
+
+                    // Use shared measurement (same as CLI bench)
+                    if let Ok((seq, iops)) = bench::measure_reads(&archive) {
+                        sum_seq += seq;
+                        sum_iops += iops;
+                    }
+                }
+
+                let archive_sz = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(1);
+                let entry = BenchEntry {
+                    label: label.clone(),
+                    pack_ms: if ROUNDS > 0 {
+                        sum_pack / ROUNDS as u128
+                    } else {
+                        0
+                    },
+                    ratio: total as f64 / archive_sz as f64,
+                    seq_mbps: sum_seq / ROUNDS as f64,
+                    iops: sum_iops / ROUNDS as f64,
+                };
+
+                {
+                    let mut out = results.lock().unwrap();
+                    out.push(entry);
+                }
+            }
+
+            let _ = std::fs::remove_dir_all(&tmp);
+            let mut p = progress.lock().unwrap();
+            p.step = p.total;
+            p.msg = "Done.".into();
+        });
+    }
+
+    fn render_bench_progress(&mut self, ui: &mut egui::Ui) {
+        // Use try_lock to never block the UI
+        if let Ok(p) = self.bench_progress.try_lock() {
+            if p.total > 0 {
+                let frac = p.step as f32 / p.total as f32;
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(ui.available_width())
+                        .text(format!("{}/{}  {}", p.step, p.total, p.msg)),
+                );
+            } else {
+                ui.label(&p.msg);
+            }
+            if p.step >= p.total && p.total > 0 {
+                self.bench_running = false;
             }
         }
     }
@@ -738,6 +873,7 @@ impl App {
 
     fn browse_page(&mut self, ui: &mut egui::Ui, load_trigger: bool) {
         ui.spacing_mut().item_spacing.y = 4.0;
+        ui.heading("Browse Archive");
         let row_h = 22.0;
 
         // address bar
@@ -747,7 +883,7 @@ impl App {
                 [ui.available_width() - 34.0, row_h],
                 egui::TextEdit::singleline(&mut self.arc.path).hint_text("archive.hxz…"),
             );
-            if ui.button("…").clicked() {
+            if ui.add(row_button("…", row_h)).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("Hexz", &["hxz"])
                     .pick_file()
@@ -764,15 +900,17 @@ impl App {
 
         // encryption
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.arc.encrypted, "AES-256");
-            if self.arc.encrypted {
-                ui.add_sized(
-                    [120.0, row_h],
-                    egui::TextEdit::singleline(&mut self.arc.password)
-                        .password(true)
-                        .hint_text("password"),
-                );
-            }
+            ui.add_sized(
+                [0.0, row_h],
+                egui::Checkbox::new(&mut self.arc.encrypted, "AES-256"),
+            );
+            password_field(
+                ui,
+                self.arc.encrypted,
+                &mut self.arc.password,
+                "browse",
+                row_h,
+            );
         });
 
         // error
@@ -783,21 +921,6 @@ impl App {
         // loaded → show file list
         if self.arc.pack.is_some() {
             self.render_browse_content(ui);
-        } else {
-            // not loaded → Load button at bottom
-            ui.add_space(24.0);
-            ui.horizontal_centered(|ui| {
-                let can_load = !self.arc.path.is_empty();
-                if ui
-                    .add_enabled(
-                        can_load,
-                        egui::Button::new("Load Archive").min_size([160.0, 30.0].into()),
-                    )
-                    .clicked()
-                {
-                    self.open_archive();
-                }
-            });
         }
     }
 
@@ -864,16 +987,12 @@ impl App {
         let n = self.arc.selected.len();
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(
-                    n > 0,
-                    egui::Button::new(format!("Extract Selected ({n})"))
-                        .min_size([160.0, 26.0].into()),
-                )
+                .add_enabled(n > 0, egui::Button::new(format!("Extract Selected ({n})")))
                 .clicked()
             {
                 self.extract_selected();
             }
-            if n > 0 && ui.button("Clear").clicked() {
+            if n > 0 && ui.add(egui::Button::new("Clear")).clicked() {
                 self.arc.selected.clear();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -887,7 +1006,7 @@ impl App {
                     self.grid_skip_frames = 2;
                 }
                 ui.separator();
-                if ui.button("Extract All").clicked() {
+                if ui.add(egui::Button::new("Extract All")).clicked() {
                     self.extract_all();
                 }
             });
@@ -1272,23 +1391,18 @@ impl App {
         let Some(ref pack) = self.arc.pack else {
             return;
         };
-        match pack.read_file(path) {
-            Ok(data) => {
-                let default_name = std::path::Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("extracted");
-                if let Some(save_path) = rfd::FileDialog::new()
-                    .set_file_name(default_name)
-                    .save_file()
-                {
-                    match std::fs::write(&save_path, &data) {
-                        Ok(_) => self.status = format!("Extracted: {}", save_path.display()),
-                        Err(e) => self.status = format!("Save error: {e}"),
-                    }
-                }
+        let default_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("extracted");
+        if let Some(save_path) = rfd::FileDialog::new()
+            .set_file_name(default_name)
+            .save_file()
+        {
+            match pack.extract_file_to(path, &save_path) {
+                Ok(_) => self.status = format!("Extracted: {}", save_path.display()),
+                Err(e) => self.status = format!("Save error: {e}"),
             }
-            Err(e) => self.status = format!("Read error: {e}"),
         }
     }
 
@@ -1330,6 +1444,16 @@ impl App {
             return;
         }
 
+        let existing = targets
+            .iter()
+            .filter(|file| {
+                safe_output_path(&out_dir, file).is_some_and(|destination| destination.exists())
+            })
+            .count();
+        if existing > 0 && !confirm_overwrite(existing) {
+            return;
+        }
+
         self.busy = true;
         self.status = "Extracting selected files…".into();
         self.progress = (0, 0);
@@ -1346,14 +1470,7 @@ impl App {
                     fail += 1;
                     continue;
                 };
-                let operation = pack.read_file(&file_path).and_then(|data| {
-                    if let Some(parent) = destination.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(destination, data)?;
-                    Ok(())
-                });
-                if operation.is_ok() {
+                if pack.extract_file_to(&file_path, &destination).is_ok() {
                     ok += 1;
                 } else {
                     fail += 1;
@@ -1365,12 +1482,22 @@ impl App {
     }
 
     fn extract_all(&mut self) {
-        let Some(ref _pack) = self.arc.pack else {
+        let Some(pack) = self.arc.pack.clone() else {
             return;
         };
         let Some(dir) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
+
+        let existing = pack
+            .iter_files()
+            .filter(|file| {
+                safe_output_path(&dir, file).is_some_and(|destination| destination.exists())
+            })
+            .count();
+        if existing > 0 && !confirm_overwrite(existing) {
+            return;
+        }
 
         self.busy = true;
         self.status = "Extracting...".into();
