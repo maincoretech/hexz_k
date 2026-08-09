@@ -52,6 +52,25 @@ pub fn pack_directory_with_progress(
     opts: &PackOptions,
     tracker: ProgressTracker,
 ) -> anyhow::Result<()> {
+    pack_directory_with_progress_impl(opts, tracker, None)
+}
+
+#[cfg(feature = "signing")]
+/// Pack a directory, add the hexz_k integrity profile, and apply a native Hexz
+/// Ed25519 signature before publishing the output.
+pub fn pack_signed_directory_with_progress(
+    opts: &PackOptions,
+    private_key: &Path,
+    tracker: ProgressTracker,
+) -> anyhow::Result<()> {
+    pack_directory_with_progress_impl(opts, tracker, Some(private_key))
+}
+
+fn pack_directory_with_progress_impl(
+    opts: &PackOptions,
+    tracker: ProgressTracker,
+    #[cfg_attr(not(feature = "signing"), allow(unused_variables))] private_key: Option<&Path>,
+) -> anyhow::Result<()> {
     use hexz_ops::pack::{PackConfig, PackTransformFlags, pack_archive};
 
     let t = tracker.clone();
@@ -92,6 +111,11 @@ pub fn pack_directory_with_progress(
     };
 
     let mut result = pack_archive(&config, Some(&cb)).context("Failed to pack archive");
+    #[cfg(feature = "signing")]
+    if let (Ok(()), Some(private_key)) = (&result, private_key) {
+        result = crate::integrity::seal_archive(actual_output, private_key)
+            .context("Failed to authenticate archive");
+    }
     if let Some(staged) = staged_output.as_ref() {
         if result.is_ok() {
             result = publish_staged_archive(&staged.archive, &staged.requested);
@@ -120,6 +144,13 @@ pub fn pack_directory_with_progress(
 pub fn pack_directory(opts: &PackOptions) -> anyhow::Result<()> {
     let tracker = ProgressTracker::new();
     pack_directory_with_progress(opts, tracker)
+}
+
+#[cfg(feature = "signing")]
+/// Pack and authenticate a directory without progress tracking.
+pub fn pack_signed_directory(opts: &PackOptions, private_key: &Path) -> anyhow::Result<()> {
+    let tracker = ProgressTracker::new();
+    pack_signed_directory_with_progress(opts, private_key, tracker)
 }
 
 fn staging_output_if_needed(input: &Path, output: &Path) -> anyhow::Result<Option<StagedOutput>> {

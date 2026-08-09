@@ -19,6 +19,7 @@ path = "src/lib.rs"
 hexz-core = { version = "0.8", default-features = false, features = ["compression-zstd", "encryption"] }
 hexz-store = { version = "0.8", default-features = false }
 hexz-ops = { version = "0.8", default-features = false, features = ["compression-zstd", "encryption"], optional = true }
+hexz-common = { version = "0.8", default-features = false, features = ["signing"], optional = true }
 
 # CLI
 clap = { version = "4", features = ["derive"], optional = true }
@@ -33,6 +34,10 @@ anyhow = "1"
 # Password input
 rpassword = { version = "7", optional = true }
 bincode = "1"
+blake3 = { version = "1.5", optional = true }
+bytes = "1"
+ed25519-dalek = { version = "2.1", default-features = false, optional = true }
+sha2 = { version = "0.10", optional = true }
 
 # GUI (optional, compile without for CLI-only)
 egui = { version = "0.31", optional = true }
@@ -44,6 +49,14 @@ image = { version = "0.25", optional = true, default-features = false, features 
 default = ["cli"]
 cli = ["dep:clap", "dep:hexz-ops", "dep:rpassword"]
 pack = ["dep:hexz-ops"]
+signing = [
+    "pack",
+    "dep:blake3",
+    "dep:ed25519-dalek",
+    "dep:hexz-common",
+    "dep:sha2",
+    "hexz-ops/signing",
+]
 gui = ["cli", "egui", "eframe", "rfd", "image"]
 
 [profile.release]

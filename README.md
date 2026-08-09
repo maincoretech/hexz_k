@@ -33,6 +33,39 @@ let bytes_read = file.read_into(&mut buffer)?;
 # Ok::<(), anyhow::Error>(())
 ```
 
+### Publisher integrity (optional)
+
+The `signing` feature keeps the archive on the standard Hexz 0.8 format while
+closing the gaps left by its native index-only signature. `seal_archive` stores
+authenticated hashes for the header, paged indices, compression dictionary,
+and physical data blocks in an extra metadata field, then applies Hexz's native
+Ed25519 signature. Existing Hexz readers ignore the extra field and continue to
+open the archive normally.
+
+At runtime, the signature and small index pages are checked while opening. Data
+blocks are authenticated lazily on their first cache miss, so startup never
+scans the full resource pack.
+
+```toml
+hexz_k = { version = "0.2", default-features = false, features = ["signing"] }
+```
+
+```rust,no_run
+use hexz_k::cmd::pack::{PackOptions, pack_signed_directory};
+use hexz_k::{ResourcePack, ResourcePackOptions};
+
+# let options: PackOptions = unimplemented!();
+pack_signed_directory(&options, std::path::Path::new("publisher.key"))?;
+
+let public_key: [u8; 32] = std::fs::read("publisher.pub")?.try_into().unwrap();
+let pack = ResourcePack::open_with_options(
+    "game.hxz",
+    None,
+    ResourcePackOptions::memory_constrained().require_integrity(public_key),
+)?;
+# Ok::<(), anyhow::Error>(())
+```
+
 ## Commands
 
 | Command | Description |
@@ -89,6 +122,7 @@ Example output:
 ```
 src/
 ├── lib.rs          Library: ResourcePack, FileCategory, TreeNode, format_size, is_encrypted
+├── integrity.rs    Optional native signature extension and lazy block authentication
 ├── bench.rs        Shared bench helpers: lorem, BENCH_CONFIGS, generate_test_files, measure_reads
 ├── main.rs         CLI entry point (clap)
 └── cmd/

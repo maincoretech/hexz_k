@@ -13,6 +13,10 @@
 /// Shared benchmark data generators and measurement functions.
 pub mod bench;
 
+/// Optional publisher-authenticated archive integrity support.
+#[cfg(feature = "signing")]
+pub mod integrity;
+
 /// Command implementations exposed as a library. `pack` gives embedding
 /// applications the directory→archive packer without the interactive CLI
 /// dependencies; `cli` additionally builds the read/list commands.
@@ -36,6 +40,9 @@ mod archive {
     pub use hexz_core::store::StorageBackend;
     pub use hexz_store;
 }
+
+#[cfg(feature = "signing")]
+pub use integrity::IntegrityPolicy;
 
 /// A loaded hexz resource pack providing file-level random access.
 ///
@@ -149,6 +156,10 @@ pub struct ResourcePackOptions {
     pub prefetch_window_blocks: Option<u32>,
     /// Verify an encrypted password by reading the first byte while opening.
     pub verify_password_on_open: bool,
+    /// Publisher integrity policy. Disabled by default for compatibility with
+    /// ordinary Hexz archives.
+    #[cfg(feature = "signing")]
+    pub integrity: IntegrityPolicy,
 }
 
 impl Default for ResourcePackOptions {
@@ -157,6 +168,8 @@ impl Default for ResourcePackOptions {
             cache_capacity_blocks: None,
             prefetch_window_blocks: None,
             verify_password_on_open: true,
+            #[cfg(feature = "signing")]
+            integrity: IntegrityPolicy::Disabled,
         }
     }
 }
@@ -171,6 +184,8 @@ impl ResourcePackOptions {
             cache_capacity_blocks: Some(256),
             prefetch_window_blocks: None,
             verify_password_on_open: true,
+            #[cfg(feature = "signing")]
+            integrity: IntegrityPolicy::Disabled,
         }
     }
 
@@ -180,7 +195,16 @@ impl ResourcePackOptions {
             cache_capacity_blocks: Some(1024),
             prefetch_window_blocks: None,
             verify_password_on_open: true,
+            #[cfg(feature = "signing")]
+            integrity: IntegrityPolicy::Disabled,
         }
+    }
+
+    /// Require a Hexz native signature plus the hexz_k integrity profile.
+    #[cfg(feature = "signing")]
+    pub const fn require_integrity(mut self, public_key: [u8; 32]) -> Self {
+        self.integrity = IntegrityPolicy::Required(public_key);
+        self
     }
 }
 
@@ -654,6 +678,18 @@ impl ResourcePack {
         encryptor: Option<Box<dyn archive::Encryptor>>,
         options: ResourcePackOptions,
     ) -> anyhow::Result<Arc<hexz_core::Archive>> {
+        #[cfg(feature = "signing")]
+        if !matches!(options.integrity, IntegrityPolicy::Disabled) {
+            let backend = integrity::verified_backend(path, options.integrity)?;
+            return hexz_core::Archive::open_with_cache(
+                backend,
+                encryptor,
+                options.cache_capacity_blocks,
+                options.prefetch_window_blocks,
+            )
+            .map_err(Into::into);
+        }
+
         archive::hexz_store::open_local_with_cache(
             path,
             encryptor,
