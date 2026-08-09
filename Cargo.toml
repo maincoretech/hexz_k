@@ -66,6 +66,17 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+[workspace]
+members = ["crates/hexz-store-local"]
+resolver = "2"
+
+# The upstream `hexz-ops` crate enables `hexz-store` defaults even for purely
+# local archive packing. Keep hexz_k's local builds free of the unrelated
+# HTTP/S3/TLS stack; embedding applications can point the same crates.io patch
+# at this repository revision.
+[patch.crates-io]
+hexz-store = { path = "crates/hexz-store-local" }
+
 [profile.dev]
 opt-level = 0
 

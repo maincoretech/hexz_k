@@ -1,0 +1,13 @@
+[package]
+name = "hexz-store"
+version = "0.8.2"
+edition = "2024"
+description = "Minimal local-file storage backend for embedded Hexz archives"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+bytes = "1.5"
+hexz-common = { version = "0.8.2", default-features = false }
+hexz-core = { version = "0.8.2", default-features = false, features = ["compression-zstd", "encryption"] }
+memmap2 = "0.9"
